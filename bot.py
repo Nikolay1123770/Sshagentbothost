@@ -1,24 +1,29 @@
 import os
 import json
 import secrets
+import asyncio
 import threading
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify, session
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 import paramiko
-import asyncio
 
 # ============ КОНФИГУРАЦИЯ ============
 BOT_TOKEN = "8360387336:AAGKU0Jv3CeJ-WubZH6VCPsL4-NDlrcbxp4"
 SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
-# Получаем порт из переменной окружения (Bothost предоставляет его)
+# Bothost автоматически устанавливает PORT
 PORT = int(os.environ.get("PORT", 5000))
 
-# Определяем домен для Bothost
+# Определяем домен
 HOSTNAME = os.environ.get("HOSTNAME", "sshagen.bothost.ru")
 WEBHOOK_URL = f"https://{HOSTNAME}"
+
+print(f"=== SSH Agent Bot ===")
+print(f"Hostname: {HOSTNAME}")
+print(f"Webhook URL: {WEBHOOK_URL}")
+print(f"Port: {PORT}")
 
 # ============ ХРАНИЛИЩЕ ДАННЫХ ============
 user_sessions = {}  # {user_id: {'servers': [], 'current_connection': None}}
@@ -586,7 +591,6 @@ def status_api():
     
     if session_id in user_sessions and user_sessions[session_id]['current_connection']:
         try:
-            # Проверяем соединение
             transport = user_sessions[session_id]['current_connection'].get_transport()
             connected = transport.is_active() if transport else False
         except:
@@ -602,7 +606,7 @@ def before_request():
     if 'session_id' not in session:
         session['session_id'] = secrets.token_hex(16)
 
-# ============ TELEGRAM BOT ============
+# ============ TELEGRAM BOT ФУНКЦИИ ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("➕ Добавить сервер", callback_data='add_server')],
@@ -679,7 +683,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             if user_id not in user_sessions:
-                user_sessions[user_id] = {}
+                user_sessions[user_id] = {'servers': []}
             user_sessions[user_id]['current_connection'] = ssh
             user_sessions[user_id]['current_server'] = server_id
             
@@ -740,82 +744,104 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Используйте /start для начала работы")
 
-# ============ НАСТРОЙКА И ЗАПУСК БОТА ============
-def setup_bot():
-    """Настройка и запуск Telegram бота"""
+# ============ НАСТРОЙКА TELEGRAM БОТА ============
+telegram_app = None
+
+def setup_telegram_bot():
+    """Настройка Telegram бота"""
+    global telegram_app
+    
     try:
-        application = Application.builder().token(BOT_TOKEN).build()
+        print("Настройка Telegram бота...")
+        telegram_app = Application.builder().token(BOT_TOKEN).build()
         
         # Добавляем обработчики
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CallbackQueryHandler(button_callback))
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        telegram_app.add_handler(CommandHandler("start", start))
+        telegram_app.add_handler(CallbackQueryHandler(button_callback))
+        telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
-        return application
+        print("Telegram бот настроен успешно")
+        return telegram_app
     except Exception as e:
         print(f"Ошибка настройки бота: {e}")
         return None
 
-# ============ ЗАПУСК FLASK ============
+async def start_telegram_bot():
+    """Запуск Telegram бота"""
+    global telegram_app
+    
+    if telegram_app is None:
+        telegram_app = setup_telegram_bot()
+    
+    if telegram_app:
+        try:
+            # На Bothost используем polling, а не webhook
+            print("Запуск Telegram бота в режиме polling...")
+            await telegram_app.initialize()
+            await telegram_app.start()
+            await telegram_app.updater.start_polling()
+            
+            print("Telegram бот запущен в режиме polling")
+            
+            # Ждём остановки
+            await telegram_app.updater.idle()
+            
+        except Exception as e:
+            print(f"Ошибка запуска бота: {e}")
+            import traceback
+            traceback.print_exc()
+
+# ============ WEBHOOK ENDPOINT ДЛЯ TELEGRAM ============
+@app.route(f'/{BOT_TOKEN}', methods=['POST'])
+async def telegram_webhook():
+    """Обработка webhook от Telegram (если потребуется)"""
+    if telegram_app:
+        json_data = await request.get_json()
+        update = Update.de_json(json_data, telegram_app.bot)
+        await telegram_app.process_update(update)
+    return '', 200
+
+@app.route('/set_webhook', methods=['GET'])
+def set_webhook():
+    """Установка webhook для Telegram"""
+    try:
+        import requests
+        response = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={WEBHOOK_URL}/{BOT_TOKEN}")
+        return jsonify({'success': True, 'response': response.json()})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/health')
+def health_check():
+    """Проверка здоровья приложения"""
+    return jsonify({'status': 'ok', 'bot': telegram_app is not None})
+
+# ============ ЗАПУСК ПРИЛОЖЕНИЯ ============
 def run_flask():
     """Запуск Flask приложения"""
     print(f"Запуск Flask на порту {PORT}")
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
-# ============ ОСНОВНОЙ ЗАПУСК ============
-async def main():
-    """Основная функция запуска"""
-    print("=== SSH Agent запускается ===")
-    print(f"Web версия доступна по адресу: {WEBHOOK_URL}")
+def start_both():
+    """Запуск Flask и Telegram бота в разных потоках"""
+    print("=== Запуск SSH Agent ===")
+    print(f"Web версия: {WEBHOOK_URL}")
     
-    # Настраиваем бота
-    bot_app = setup_bot()
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
     
-    if bot_app:
-        print("Бот настроен успешно")
-        
-        # Настраиваем webhook
-        try:
-            await bot_app.initialize()
-            await bot_app.start()
-            
-            # Устанавливаем webhook
-            await bot_app.bot.set_webhook(
-                url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
-                drop_pending_updates=True
-            )
-            print(f"Webhook установлен: {WEBHOOK_URL}/{BOT_TOKEN}")
-            
-            # Запускаем Flask в отдельном потоке
-            import threading
-            flask_thread = threading.Thread(target=run_flask, daemon=True)
-            flask_thread.start()
-            
-            # Ждём завершения
-            await bot_app.updater.start_polling()
-            
-            # Бесконечно ждём
-            while True:
-                await asyncio.sleep(3600)
-                
-        except Exception as e:
-            print(f"Ошибка запуска бота: {e}")
-    else:
-        print("Не удалось настроить бота, запускаем только Flask")
-        run_flask()
-
-# ============ WEBHOOK ENDPOINT ============
-@app.route(f'/{BOT_TOKEN}', methods=['POST'])
-async def webhook():
-    """Обработка webhook запросов от Telegram"""
-    if bot_app:
-        update = Update.de_json(await request.get_json(), bot_app.bot)
-        await bot_app.process_update(update)
-    return '', 200
-
-# Глобальная переменная для хранения приложения бота
-bot_app = None
+    # Запускаем Telegram бота в основном потоке
+    asyncio.run(start_telegram_bot())
 
 if __name__ == '__main__':
-    # Запускаем асинхронно
-    asyncio.run(main())
+    # На Bothost нужно запускать через gunicorn, поэтому
+    # просто экспортируем app для gunicorn
+    # Бот запустится автоматически при импорте
+    print("SSH Agent Bot инициализирован")
+    print(f"Домен: {HOSTNAME}")
+    
+    # Запускаем бота в фоновом режиме
+    import threading
+    bot_thread = threading.Thread(target=lambda: asyncio.run(start_telegram_bot()), daemon=True)
+    bot_thread.start()
