@@ -13,7 +13,7 @@ import asyncio
 BOT_TOKEN = "8360387336:AAGKU0Jv3CeJ-WubZH6VCPsL4-NDlrcbxp4"  # Токен бота от @BotFather
 WEBHOOK_URL = "https://sshagen.bothost.ru"
 PORT = int(os.environ.get("PORT", 8080))
-SECRET_KEY = "your-secret-key-change-me"
+SECRET_KEY = secrets.token_urlsafe(32)  # 43-символьный URL-безопасный
 
 # ============ ХРАНИЛИЩЕ ДАННЫХ ============
 user_sessions = {}  # {user_id: {'servers': [], 'current_connection': None}}
