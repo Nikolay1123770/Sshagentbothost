@@ -10,7 +10,7 @@ import io
 import asyncio
 
 # ============ КОНФИГУРАЦИЯ ============
-BOT_TOKEN = "YOUR_BOT_TOKEN"  # Токен бота от @BotFather
+BOT_TOKEN = "8360387336:AAGKU0Jv3CeJ-WubZH6VCPsL4-NDlrcbxp4"  # Токен бота от @BotFather
 WEBHOOK_URL = "https://sshagen.bothost.ru"
 PORT = int(os.environ.get("PORT", 8080))
 SECRET_KEY = "your-secret-key-change-me"
