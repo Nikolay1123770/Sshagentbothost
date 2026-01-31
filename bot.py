@@ -2,14 +2,19 @@ import os
 import json
 import secrets
 import asyncio
-import threading
 import logging
-import base64
 import mimetypes
 from datetime import datetime
-from io import StringIO, BytesIO
 from pathlib import Path
-from flask import Flask, render_template_string, request, jsonify, session, send_file
+from io import BytesIO
+from typing import Dict, List, Optional
+
+from fastapi import FastAPI, Request, Response, Form, UploadFile, File
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 import paramiko
@@ -26,28 +31,32 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "8360387336:AAGKU0Jv3CeJ-WubZH6VCPsL4-NDlrcbxp4"
 SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
-# Bothost автоматически устанавливает PORT
-PORT = int(os.environ.get("PORT", 3000))
-
-# Определяем домен - используем internal domain от Bothost
-HOSTNAME = os.environ.get("HOSTNAME", os.environ.get("INTERNAL_DOMAIN", "f94c91e2287e"))
-WEBHOOK_URL = f"https://{HOSTNAME}"
-
-# Используем polling на Bothost
-USE_WEBHOOK = False
-
 logger.info(f"=== SSH Agent Pro ===")
-logger.info(f"Hostname: {HOSTNAME}")
-logger.info(f"Webhook URL: {WEBHOOK_URL}")
-logger.info(f"Port: {PORT}")
+logger.info(f"Bot Token: {BOT_TOKEN[:10]}...")
 
 # ============ ХРАНИЛИЩЕ ДАННЫХ ============
-user_sessions = {}  # {user_id: {'servers': [], 'current_connection': None, 'sftp': None}}
+user_sessions: Dict[str, Dict] = {}  # {user_id: {'servers': [], 'current_connection': None, 'sftp': None}}
+web_sessions: Dict[str, Dict] = {}   # {session_id: {'servers': [], 'current_connection': None, 'sftp': None}}
 
-# ============ FLASK WEB APPLICATION ============
-app = Flask(__name__)
-app.secret_key = SECRET_KEY
+# ============ FASTAPI APPLICATION ============
+app = FastAPI(title="SSH Agent Pro", version="2.0")
+templates = Jinja2Templates(directory="templates")
 
+# Модели данных
+class Server(BaseModel):
+    name: str
+    host: str
+    port: int = 22
+    user: str
+    password: str
+
+class CommandRequest(BaseModel):
+    command: str
+
+class PathRequest(BaseModel):
+    path: str = "/"
+
+# ============ HTML ШАБЛОН ============
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -85,143 +94,86 @@ HTML_TEMPLATE = """
             background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
             min-height: 100vh;
             color: var(--dark);
-        }
-        
-        .app-container {
-            display: flex;
-            min-height: 100vh;
-        }
-        
-        /* Сайдбар */
-        .sidebar {
-            width: 260px;
-            background: var(--sidebar-bg);
-            color: white;
-            padding: 20px 0;
-            box-shadow: 4px 0 10px rgba(0,0,0,0.1);
-            display: flex;
-            flex-direction: column;
-        }
-        
-        .sidebar-header {
-            padding: 0 20px 20px;
-            border-bottom: 1px solid rgba(255,255,255,0.1);
-            text-align: center;
-        }
-        
-        .sidebar-header h1 {
-            font-size: 1.5rem;
-            margin-bottom: 5px;
-            color: var(--primary);
-        }
-        
-        .sidebar-header p {
-            font-size: 0.8rem;
-            opacity: 0.7;
-        }
-        
-        .nav-section {
             padding: 20px;
         }
         
-        .nav-section h3 {
-            font-size: 0.9rem;
-            text-transform: uppercase;
-            color: var(--gray);
-            margin-bottom: 15px;
-            letter-spacing: 1px;
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: var(--card-bg);
+            border-radius: 20px;
+            overflow: hidden;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
         }
         
-        .nav-item {
-            display: flex;
-            align-items: center;
-            padding: 12px 15px;
-            margin-bottom: 8px;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: all 0.3s;
-            color: var(--gray-light);
-        }
-        
-        .nav-item:hover {
-            background: rgba(255,255,255,0.1);
+        .app-header {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
             color: white;
-            transform: translateX(5px);
-        }
-        
-        .nav-item.active {
-            background: var(--primary);
-            color: white;
-            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
-        }
-        
-        .nav-item i {
-            margin-right: 10px;
-            width: 20px;
+            padding: 30px 40px;
             text-align: center;
         }
         
-        .server-status {
-            margin-top: auto;
-            padding: 20px;
-            background: rgba(0,0,0,0.2);
-            border-top: 1px solid rgba(255,255,255,0.1);
-        }
-        
-        .status-indicator {
-            display: flex;
-            align-items: center;
+        .app-header h1 {
+            font-size: 2.5rem;
             margin-bottom: 10px;
         }
         
-        .status-dot {
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            margin-right: 10px;
-            animation: pulse 2s infinite;
+        .app-header p {
+            opacity: 0.9;
+            font-size: 1.1rem;
         }
         
-        .status-online {
-            background: var(--success);
-            box-shadow: 0 0 10px var(--success);
-        }
-        
-        .status-offline {
-            background: var(--danger);
-            box-shadow: 0 0 10px var(--danger);
-        }
-        
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.5; }
-            100% { opacity: 1; }
-        }
-        
-        /* Основной контент */
-        .main-content {
-            flex: 1;
+        .app-nav {
+            background: var(--sidebar-bg);
             padding: 20px;
-            overflow-y: auto;
-        }
-        
-        .content-header {
             display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 30px;
-            background: var(--card-bg);
-            padding: 20px;
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+            gap: 10px;
+            overflow-x: auto;
         }
         
-        .content-header h2 {
-            color: var(--dark);
-            font-size: 1.8rem;
+        .nav-btn {
+            padding: 12px 24px;
+            background: rgba(255,255,255,0.1);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+            white-space: nowrap;
         }
         
-        .stats-grid {
+        .nav-btn:hover {
+            background: rgba(255,255,255,0.2);
+            transform: translateY(-2px);
+        }
+        
+        .nav-btn.active {
+            background: var(--primary);
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        .content-area {
+            padding: 30px;
+            min-height: 600px;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+            animation: fadeIn 0.3s ease-in;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        /* Dashboard */
+        .dashboard-stats {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 20px;
@@ -229,26 +181,21 @@ HTML_TEMPLATE = """
         }
         
         .stat-card {
-            background: var(--card-bg);
+            background: var(--light);
             padding: 25px;
             border-radius: 12px;
+            text-align: center;
             box-shadow: 0 4px 15px rgba(0,0,0,0.05);
-            transition: transform 0.3s, box-shadow 0.3s;
-        }
-        
-        .stat-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 8px 25px rgba(0,0,0,0.1);
         }
         
         .stat-card i {
-            font-size: 2rem;
-            margin-bottom: 15px;
+            font-size: 2.5rem;
             color: var(--primary);
+            margin-bottom: 15px;
         }
         
         .stat-card h3 {
-            font-size: 2rem;
+            font-size: 2.2rem;
             margin-bottom: 5px;
             color: var(--dark);
         }
@@ -258,13 +205,12 @@ HTML_TEMPLATE = """
             font-size: 0.9rem;
         }
         
-        /* Терминал */
+        /* Terminal */
         .terminal-container {
             background: var(--terminal-bg);
             border-radius: 12px;
             overflow: hidden;
             margin-bottom: 20px;
-            box-shadow: 0 8px 30px rgba(0,0,0,0.3);
         }
         
         .terminal-header {
@@ -289,12 +235,6 @@ HTML_TEMPLATE = """
         .terminal-dot.red { background: #ef4444; }
         .terminal-dot.yellow { background: #f59e0b; }
         .terminal-dot.green { background: #10b981; }
-        
-        .terminal-title {
-            margin-left: 20px;
-            color: var(--gray-light);
-            font-family: 'Courier New', monospace;
-        }
         
         .terminal-body {
             padding: 20px;
@@ -323,6 +263,7 @@ HTML_TEMPLATE = """
             color: var(--terminal-text);
             margin-right: 10px;
             font-family: 'Courier New', monospace;
+            padding: 8px 0;
         }
         
         .terminal-input-field {
@@ -333,89 +274,10 @@ HTML_TEMPLATE = """
             font-family: 'Courier New', monospace;
             font-size: 14px;
             outline: none;
+            padding: 8px;
         }
         
-        /* Файловый менеджер */
-        .file-manager {
-            background: var(--card-bg);
-            border-radius: 12px;
-            overflow: hidden;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
-        }
-        
-        .fm-header {
-            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
-            color: white;
-            padding: 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        
-        .fm-path {
-            font-family: 'Courier New', monospace;
-            background: rgba(0,0,0,0.2);
-            padding: 8px 15px;
-            border-radius: 6px;
-            font-size: 14px;
-        }
-        
-        .fm-toolbar {
-            display: flex;
-            gap: 10px;
-            padding: 15px 20px;
-            background: var(--light);
-            border-bottom: 1px solid var(--gray-light);
-        }
-        
-        .fm-content {
-            padding: 20px;
-            min-height: 400px;
-            max-height: 500px;
-            overflow-y: auto;
-        }
-        
-        .file-list {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-            gap: 15px;
-        }
-        
-        .file-item {
-            background: var(--light);
-            border-radius: 8px;
-            padding: 15px;
-            text-align: center;
-            cursor: pointer;
-            transition: all 0.3s;
-            border: 2px solid transparent;
-        }
-        
-        .file-item:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-            border-color: var(--primary);
-        }
-        
-        .file-icon {
-            font-size: 2rem;
-            margin-bottom: 10px;
-            color: var(--primary);
-        }
-        
-        .file-name {
-            font-size: 0.9rem;
-            font-weight: 600;
-            margin-bottom: 5px;
-            word-break: break-all;
-        }
-        
-        .file-size {
-            font-size: 0.8rem;
-            color: var(--gray);
-        }
-        
-        /* Кнопки */
+        /* Buttons */
         .btn {
             display: inline-flex;
             align-items: center;
@@ -441,12 +303,12 @@ HTML_TEMPLATE = """
         }
         
         .btn-success {
-            background: linear-gradient(135deg, var(--success) 0%, #059669 100%);
+            background: var(--success);
             color: white;
         }
         
         .btn-danger {
-            background: linear-gradient(135deg, var(--danger) 0%, #dc2626 100%);
+            background: var(--danger);
             color: white;
         }
         
@@ -456,7 +318,101 @@ HTML_TEMPLATE = """
             color: var(--primary);
         }
         
-        /* Модальные окна */
+        /* Server List */
+        .servers-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        
+        .server-card {
+            background: var(--light);
+            border-radius: 12px;
+            padding: 20px;
+            border: 2px solid var(--gray-light);
+            transition: all 0.3s;
+        }
+        
+        .server-card.active {
+            border-color: var(--primary);
+            background: #f0f5ff;
+        }
+        
+        .server-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+        }
+        
+        .server-name {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: var(--dark);
+        }
+        
+        .server-details {
+            color: var(--gray);
+            font-size: 0.9rem;
+            margin-bottom: 15px;
+        }
+        
+        .server-actions {
+            display: flex;
+            gap: 10px;
+        }
+        
+        /* File Manager */
+        .file-manager {
+            background: var(--light);
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+        
+        .fm-toolbar {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        
+        .file-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+            gap: 15px;
+        }
+        
+        .file-item {
+            background: white;
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            border: 2px solid transparent;
+        }
+        
+        .file-item:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            border-color: var(--primary);
+        }
+        
+        .file-icon {
+            font-size: 2rem;
+            color: var(--primary);
+            margin-bottom: 10px;
+        }
+        
+        .file-name {
+            font-size: 0.9rem;
+            font-weight: 600;
+            margin-bottom: 5px;
+            word-break: break-all;
+        }
+        
+        /* Modals */
         .modal {
             display: none;
             position: fixed;
@@ -468,7 +424,6 @@ HTML_TEMPLATE = """
             justify-content: center;
             align-items: center;
             z-index: 1000;
-            backdrop-filter: blur(5px);
         }
         
         .modal.active {
@@ -483,25 +438,9 @@ HTML_TEMPLATE = """
             width: 90%;
             max-height: 80vh;
             overflow-y: auto;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            animation: modalAppear 0.3s ease-out;
-        }
-        
-        @keyframes modalAppear {
-            from {
-                opacity: 0;
-                transform: translateY(-30px) scale(0.9);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0) scale(1);
-            }
         }
         
         .modal-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
             margin-bottom: 20px;
             padding-bottom: 15px;
             border-bottom: 1px solid var(--gray-light);
@@ -509,14 +448,6 @@ HTML_TEMPLATE = """
         
         .modal-header h2 {
             color: var(--dark);
-        }
-        
-        .modal-close {
-            background: none;
-            border: none;
-            font-size: 1.5rem;
-            cursor: pointer;
-            color: var(--gray);
         }
         
         .form-group {
@@ -550,141 +481,100 @@ HTML_TEMPLATE = """
             margin-top: 30px;
         }
         
-        /* Вкладки */
-        .tabs {
-            display: flex;
-            border-bottom: 2px solid var(--gray-light);
+        /* Connection Status */
+        .connection-status {
+            padding: 20px;
+            background: var(--light);
+            border-radius: 12px;
             margin-bottom: 20px;
         }
         
-        .tab {
-            padding: 12px 24px;
-            cursor: pointer;
-            border-bottom: 3px solid transparent;
-            transition: all 0.3s;
-            font-weight: 600;
-            color: var(--gray);
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
         }
         
-        .tab:hover {
-            color: var(--primary);
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
         }
         
-        .tab.active {
-            color: var(--primary);
-            border-bottom-color: var(--primary);
+        .status-online {
+            background: var(--success);
+            box-shadow: 0 0 10px var(--success);
         }
         
-        .tab-content {
-            display: none;
+        .status-offline {
+            background: var(--danger);
+            box-shadow: 0 0 10px var(--danger);
         }
         
-        .tab-content.active {
-            display: block;
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
         }
         
-        /* Адаптивность */
-        @media (max-width: 1024px) {
-            .app-container {
-                flex-direction: column;
-            }
-            
-            .sidebar {
-                width: 100%;
-                height: auto;
-            }
-            
-            .stats-grid {
-                grid-template-columns: repeat(2, 1fr);
-            }
-        }
-        
+        /* Responsive */
         @media (max-width: 768px) {
-            .stats-grid {
+            .dashboard-stats {
                 grid-template-columns: 1fr;
             }
             
-            .content-header {
-                flex-direction: column;
-                gap: 15px;
-                text-align: center;
+            .servers-grid {
+                grid-template-columns: 1fr;
             }
             
-            .file-list {
-                grid-template-columns: repeat(2, 1fr);
+            .app-nav {
+                flex-wrap: wrap;
+            }
+            
+            .nav-btn {
+                flex: 1;
+                min-width: 120px;
             }
         }
-        
-        /* Утилиты */
-        .text-success { color: var(--success); }
-        .text-danger { color: var(--danger); }
-        .text-warning { color: var(--warning); }
-        .text-muted { color: var(--gray); }
-        
-        .mb-3 { margin-bottom: 15px; }
-        .mt-3 { margin-top: 15px; }
-        .text-center { text-align: center; }
     </style>
 </head>
 <body>
-    <div class="app-container">
-        <!-- Сайдбар -->
-        <div class="sidebar">
-            <div class="sidebar-header">
-                <h1><i class="fas fa-terminal"></i> SSH Agent Pro</h1>
-                <p>Расширенное управление серверами</p>
-            </div>
-            
-            <div class="nav-section">
-                <h3>Основное</h3>
-                <div class="nav-item active" onclick="showTab('dashboard')">
-                    <i class="fas fa-tachometer-alt"></i> Дашборд
-                </div>
-                <div class="nav-item" onclick="showTab('servers')">
-                    <i class="fas fa-server"></i> Серверы
-                </div>
-                <div class="nav-item" onclick="showTab('terminal')">
-                    <i class="fas fa-terminal"></i> Терминал
-                </div>
-                <div class="nav-item" onclick="showTab('filemanager')">
-                    <i class="fas fa-folder-open"></i> Файловый менеджер
-                </div>
-            </div>
-            
-            <div class="nav-section">
-                <h3>Инструменты</h3>
-                <div class="nav-item" onclick="showTab('monitoring')">
-                    <i class="fas fa-chart-line"></i> Мониторинг
-                </div>
-                <div class="nav-item" onclick="showTab('backup')">
-                    <i class="fas fa-database"></i> Бэкапы
-                </div>
-                <div class="nav-item" onclick="showTab('settings')">
-                    <i class="fas fa-cog"></i> Настройки
-                </div>
-            </div>
-            
-            <div class="server-status">
-                <div class="status-indicator">
-                    <span class="status-dot status-offline"></span>
-                    <span>Сервер не подключен</span>
-                </div>
-                <div id="currentServerInfo"></div>
-            </div>
+    <div class="container">
+        <div class="app-header">
+            <h1><i class="fas fa-terminal"></i> SSH Agent Pro</h1>
+            <p>Расширенное управление SSH серверами</p>
         </div>
         
-        <!-- Основной контент -->
-        <div class="main-content">
-            <!-- Дашборд -->
+        <div class="app-nav">
+            <button class="nav-btn active" onclick="showTab('dashboard')">
+                <i class="fas fa-tachometer-alt"></i> Дашборд
+            </button>
+            <button class="nav-btn" onclick="showTab('servers')">
+                <i class="fas fa-server"></i> Серверы
+            </button>
+            <button class="nav-btn" onclick="showTab('terminal')">
+                <i class="fas fa-terminal"></i> Терминал
+            </button>
+            <button class="nav-btn" onclick="showTab('filemanager')">
+                <i class="fas fa-folder-open"></i> Файлы
+            </button>
+            <button class="nav-btn" onclick="showTab('monitoring')">
+                <i class="fas fa-chart-line"></i> Мониторинг
+            </button>
+        </div>
+        
+        <div class="content-area">
+            <!-- Dashboard -->
             <div id="dashboard" class="tab-content active">
-                <div class="content-header">
-                    <h2><i class="fas fa-tachometer-alt"></i> Дашборд</h2>
-                    <button class="btn btn-primary" onclick="openAddServerModal()">
-                        <i class="fas fa-plus"></i> Добавить сервер
-                    </button>
+                <div class="connection-status">
+                    <div class="status-indicator">
+                        <span class="status-dot status-offline"></span>
+                        <span id="statusText">Сервер не подключен</span>
+                    </div>
                 </div>
                 
-                <div class="stats-grid">
+                <div class="dashboard-stats">
                     <div class="stat-card">
                         <i class="fas fa-server"></i>
                         <h3 id="serversCount">0</h3>
@@ -693,98 +583,51 @@ HTML_TEMPLATE = """
                     <div class="stat-card">
                         <i class="fas fa-plug"></i>
                         <h3 id="activeConnections">0</h3>
-                        <p>Активных подключений</p>
+                        <p>Подключений</p>
                     </div>
                     <div class="stat-card">
                         <i class="fas fa-code"></i>
                         <h3 id="commandsCount">0</h3>
-                        <p>Выполнено команд</p>
+                        <p>Команд</p>
                     </div>
                     <div class="stat-card">
-                        <i class="fas fa-hdd"></i>
+                        <i class="fas fa-file"></i>
                         <h3 id="filesCount">0</h3>
-                        <p>Обработано файлов</p>
+                        <p>Файлов</p>
                     </div>
                 </div>
                 
-                <div class="terminal-container mb-3">
-                    <div class="terminal-header">
-                        <div class="terminal-dots">
-                            <div class="terminal-dot red"></div>
-                            <div class="terminal-dot yellow"></div>
-                            <div class="terminal-dot green"></div>
-                        </div>
-                        <div class="terminal-title">Быстрый терминал</div>
-                    </div>
-                    <div class="terminal-body">
-                        <div class="terminal-output" id="quickTerminal">
-SSH Agent Pro v2.0
-Добро пожаловать в расширенную систему управления серверами!
-
-Для начала работы:
-1. Добавьте сервер через меню "Серверы"
-2. Подключитесь к серверу
-3. Используйте терминал или файловый менеджер
-
-Доступные функции:
-✓ Управление серверами через SSH
-✓ Файловый менеджер с предпросмотром
-✓ Мониторинг ресурсов
-✓ Создание бэкапов
-✓ Управление процессами
-                        </div>
-                    </div>
-                    <div class="terminal-input">
-                        <span class="terminal-prompt">$</span>
-                        <input type="text" class="terminal-input-field" id="quickCommand" 
-                               placeholder="Быстрая команда..." onkeypress="if(event.key=='Enter') executeQuickCommand()">
-                    </div>
-                </div>
-                
-                <div class="file-manager">
-                    <div class="fm-header">
-                        <h3><i class="fas fa-history"></i> Последние действия</h3>
-                    </div>
-                    <div class="fm-content">
-                        <div id="recentActivities"></div>
-                    </div>
+                <div style="text-align: center; margin: 40px 0;">
+                    <button class="btn btn-primary" style="padding: 15px 30px; font-size: 16px;" onclick="showTab('servers')">
+                        <i class="fas fa-plus"></i> Добавить первый сервер
+                    </button>
                 </div>
             </div>
             
-            <!-- Серверы -->
+            <!-- Servers -->
             <div id="servers" class="tab-content">
-                <div class="content-header">
-                    <h2><i class="fas fa-server"></i> Управление серверами</h2>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                    <h2 style="color: var(--dark);">Управление серверами</h2>
                     <button class="btn btn-primary" onclick="openAddServerModal()">
                         <i class="fas fa-plus"></i> Добавить сервер
                     </button>
                 </div>
                 
-                <div class="file-manager">
-                    <div class="fm-toolbar">
-                        <button class="btn btn-outline" onclick="testAllServers()">
-                            <i class="fas fa-play"></i> Тестировать все
-                        </button>
-                        <button class="btn btn-danger" onclick="removeAllServers()">
-                            <i class="fas fa-trash"></i> Удалить все
-                        </button>
-                    </div>
-                    <div class="fm-content">
-                        <div id="serversList"></div>
-                    </div>
+                <div id="serversList">
+                    <!-- Серверы будут загружены здесь -->
                 </div>
             </div>
             
-            <!-- Терминал -->
+            <!-- Terminal -->
             <div id="terminal" class="tab-content">
-                <div class="content-header">
-                    <h2><i class="fas fa-terminal"></i> Расширенный терминал</h2>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                    <h2 style="color: var(--dark);">SSH Терминал</h2>
                     <div>
-                        <button class="btn btn-success" onclick="clearTerminal()">
+                        <button class="btn btn-outline" onclick="clearTerminal()">
                             <i class="fas fa-broom"></i> Очистить
                         </button>
-                        <button class="btn btn-primary" onclick="saveTerminalLog()">
-                            <i class="fas fa-save"></i> Сохранить лог
+                        <button class="btn btn-success" id="execBtn" disabled onclick="executeCommand()">
+                            <i class="fas fa-play"></i> Выполнить
                         </button>
                     </div>
                 </div>
@@ -796,31 +639,27 @@ SSH Agent Pro v2.0
                             <div class="terminal-dot yellow"></div>
                             <div class="terminal-dot green"></div>
                         </div>
-                        <div class="terminal-title" id="terminalTitle">Терминал (не подключено)</div>
                     </div>
                     <div class="terminal-body">
-                        <div class="terminal-output" id="terminalOutput"></div>
+                        <div class="terminal-output" id="terminalOutput">
+Добро пожаловать в SSH Agent Pro!
+Для начала работы:
+1. Добавьте сервер на вкладке "Серверы"
+2. Подключитесь к серверу
+3. Используйте терминал для управления
+                        </div>
                     </div>
                     <div class="terminal-input">
-                        <span class="terminal-prompt" id="terminalPrompt">$</span>
+                        <span class="terminal-prompt">$</span>
                         <input type="text" class="terminal-input-field" id="commandInput" 
                                placeholder="Введите команду..." disabled
-                               onkeypress="if(event.key=='Enter') executeCommand()">
-                        <button class="btn btn-success" onclick="executeCommand()" id="execBtn" disabled>
-                            <i class="fas fa-play"></i>
-                        </button>
+                               onkeypress="if(event.key === 'Enter') executeCommand()">
                     </div>
                 </div>
                 
-                <div class="tabs mt-3">
-                    <div class="tab active" onclick="showCommandTab('common')">Частые команды</div>
-                    <div class="tab" onclick="showCommandTab('system')">Системные</div>
-                    <div class="tab" onclick="showCommandTab('network')">Сеть</div>
-                    <div class="tab" onclick="showCommandTab('custom')">Мои команды</div>
-                </div>
-                
-                <div id="commonCommands" class="tab-content active mt-3">
-                    <div class="command-buttons">
+                <div style="margin-top: 20px;">
+                    <h3 style="color: var(--dark); margin-bottom: 10px;">Быстрые команды:</h3>
+                    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
                         <button class="btn btn-outline" onclick="insertCommand('pwd')">pwd</button>
                         <button class="btn btn-outline" onclick="insertCommand('ls -la')">ls -la</button>
                         <button class="btn btn-outline" onclick="insertCommand('df -h')">df -h</button>
@@ -831,56 +670,59 @@ SSH Agent Pro v2.0
                 </div>
             </div>
             
-            <!-- Файловый менеджер -->
+            <!-- File Manager -->
             <div id="filemanager" class="tab-content">
-                <div class="content-header">
-                    <h2><i class="fas fa-folder-open"></i> Файловый менеджер</h2>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                    <h2 style="color: var(--dark);">Файловый менеджер</h2>
                     <div>
-                        <button class="btn btn-primary" onclick="refreshFileManager()">
+                        <button class="btn btn-outline" onclick="refreshFiles()">
                             <i class="fas fa-sync"></i> Обновить
                         </button>
-                        <button class="btn btn-success" onclick="openUploadModal()">
+                        <button class="btn btn-primary" onclick="openUploadModal()">
                             <i class="fas fa-upload"></i> Загрузить
                         </button>
                     </div>
                 </div>
                 
                 <div class="file-manager">
-                    <div class="fm-header">
-                        <div>
-                            <h3><i class="fas fa-folder"></i> <span id="currentPath">/</span></h3>
-                            <div class="fm-path" id="breadcrumbs">/</div>
-                        </div>
-                        <div class="fm-toolbar">
-                            <button class="btn btn-outline" onclick="goUp()">
-                                <i class="fas fa-level-up-alt"></i> Наверх
-                            </button>
-                            <button class="btn btn-outline" onclick="createFolder()">
-                                <i class="fas fa-folder-plus"></i> Создать папку
-                            </button>
-                            <button class="btn btn-danger" onclick="deleteSelected()">
-                                <i class="fas fa-trash"></i> Удалить
-                            </button>
-                        </div>
+                    <div style="margin-bottom: 20px;">
+                        <h3 style="color: var(--dark); margin-bottom: 10px;">Текущий путь:</h3>
+                        <div style="background: white; padding: 10px 15px; border-radius: 8px; font-family: monospace;" id="currentPath">/</div>
                     </div>
                     
-                    <div class="fm-content">
-                        <div id="fileManagerLoading" class="text-center">
-                            <p>Загрузка файлов...</p>
-                        </div>
-                        <div id="fileList" class="file-list"></div>
+                    <div class="fm-toolbar">
+                        <button class="btn btn-outline" onclick="goUp()">
+                            <i class="fas fa-level-up-alt"></i> Наверх
+                        </button>
+                        <button class="btn btn-outline" onclick="createFolder()">
+                            <i class="fas fa-folder-plus"></i> Новая папка
+                        </button>
+                        <button class="btn btn-danger" onclick="deleteSelected()" id="deleteBtn" disabled>
+                            <i class="fas fa-trash"></i> Удалить выбранное
+                        </button>
                     </div>
+                    
+                    <div id="fileList">
+                        <!-- Файлы будут загружены здесь -->
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Monitoring -->
+            <div id="monitoring" class="tab-content">
+                <h2 style="color: var(--dark); margin-bottom: 20px;">Мониторинг серверов</h2>
+                <div id="monitoringContent">
+                    <p>Для просмотра мониторинга подключитесь к серверу.</p>
                 </div>
             </div>
         </div>
     </div>
     
-    <!-- Модальное окно добавления сервера -->
+    <!-- Modal: Add Server -->
     <div class="modal" id="addServerModal">
         <div class="modal-content">
             <div class="modal-header">
                 <h2><i class="fas fa-plus"></i> Добавить SSH сервер</h2>
-                <button class="modal-close" onclick="closeAddServerModal()">&times;</button>
             </div>
             <div class="form-group">
                 <label class="form-label">Название сервера</label>
@@ -906,62 +748,32 @@ SSH Agent Pro v2.0
                 <button class="btn btn-primary" onclick="addServer()">
                     <i class="fas fa-check"></i> Добавить
                 </button>
-                <button class="btn btn-danger" onclick="closeAddServerModal()">
+                <button class="btn btn-danger" onclick="closeModal('addServerModal')">
                     <i class="fas fa-times"></i> Отмена
                 </button>
             </div>
         </div>
     </div>
     
-    <!-- Модальное окно редактирования файла -->
-    <div class="modal" id="editFileModal">
-        <div class="modal-content" style="max-width: 800px;">
-            <div class="modal-header">
-                <h2><i class="fas fa-edit"></i> Редактирование файла</h2>
-                <button class="modal-close" onclick="closeEditFileModal()">&times;</button>
-            </div>
-            <div class="form-group">
-                <label class="form-label">Путь к файлу</label>
-                <input type="text" class="form-input" id="editFilePath" readonly>
-            </div>
-            <div class="form-group">
-                <label class="form-label">Содержимое</label>
-                <textarea class="form-input" id="editFileContent" rows="15" style="font-family: 'Courier New', monospace;"></textarea>
-            </div>
-            <div class="form-actions">
-                <button class="btn btn-success" onclick="saveFile()">
-                    <i class="fas fa-save"></i> Сохранить
-                </button>
-                <button class="btn btn-primary" onclick="downloadFile()">
-                    <i class="fas fa-download"></i> Скачать
-                </button>
-                <button class="btn btn-danger" onclick="closeEditFileModal()">
-                    <i class="fas fa-times"></i> Отмена
-                </button>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Модальное окно загрузки файла -->
+    <!-- Modal: Upload Files -->
     <div class="modal" id="uploadModal">
         <div class="modal-content">
             <div class="modal-header">
-                <h2><i class="fas fa-upload"></i> Загрузка файла на сервер</h2>
-                <button class="modal-close" onclick="closeUploadModal()">&times;</button>
+                <h2><i class="fas fa-upload"></i> Загрузка файлов</h2>
             </div>
             <div class="form-group">
                 <label class="form-label">Путь для загрузки</label>
                 <input type="text" class="form-input" id="uploadPath" value="/tmp">
             </div>
             <div class="form-group">
-                <label class="form-label">Выберите файл</label>
+                <label class="form-label">Выберите файлы</label>
                 <input type="file" class="form-input" id="fileUpload" multiple>
             </div>
             <div class="form-actions">
                 <button class="btn btn-success" onclick="uploadFiles()">
                     <i class="fas fa-upload"></i> Загрузить
                 </button>
-                <button class="btn btn-danger" onclick="closeUploadModal()">
+                <button class="btn btn-danger" onclick="closeModal('uploadModal')">
                     <i class="fas fa-times"></i> Отмена
                 </button>
             </div>
@@ -980,251 +792,71 @@ SSH Agent Pro v2.0
         // Инициализация
         document.addEventListener('DOMContentLoaded', function() {
             loadServers();
-            loadRecentActivities();
+            updateStats();
             
-            // Автофокус на поле команды
-            document.getElementById('commandInput').addEventListener('keydown', function(e) {
-                if (e.key === 'Tab') {
-                    e.preventDefault();
-                    this.value += '    ';
+            // Загрузить сессию из localStorage
+            const savedSession = localStorage.getItem('ssh_agent_session');
+            if (savedSession) {
+                try {
+                    const sessionData = JSON.parse(savedSession);
+                    servers = sessionData.servers || [];
+                    currentServer = sessionData.currentServer;
+                    commandsExecuted = sessionData.commandsExecuted || 0;
+                    filesProcessed = sessionData.filesProcessed || 0;
+                    
+                    if (currentServer !== null) {
+                        updateConnectionStatus(true);
+                    }
+                    renderServers();
+                    updateStats();
+                } catch (e) {
+                    console.error('Ошибка загрузки сессии:', e);
                 }
-            });
+            }
         });
         
-        // Навигация по вкладкам
+        // Навигация
         function showTab(tabName) {
             // Скрыть все вкладки
             document.querySelectorAll('.tab-content').forEach(tab => {
                 tab.classList.remove('active');
             });
             
-            // Скрыть активный элемент в сайдбаре
-            document.querySelectorAll('.nav-item').forEach(item => {
-                item.classList.remove('active');
+            // Убрать active у всех кнопок
+            document.querySelectorAll('.nav-btn').forEach(btn => {
+                btn.classList.remove('active');
             });
             
             // Показать выбранную вкладку
             document.getElementById(tabName).classList.add('active');
             
-            // Активировать соответствующий элемент в сайдбаре
-            document.querySelector(`.nav-item[onclick*="${tabName}"]`).classList.add('active');
+            // Активировать кнопку
+            document.querySelector(`.nav-btn[onclick*="${tabName}"]`).classList.add('active');
             
-            // При показе файлового менеджера обновить список файлов
+            // При показе файлового менеджера загрузить файлы
             if (tabName === 'filemanager' && currentServer !== null) {
-                loadFileList(currentPath);
+                loadFiles(currentPath);
             }
         }
         
-        function showCommandTab(tabName) {
-            // Скрыть все вкладки команд
-            document.querySelectorAll('#terminal .tab-content').forEach(tab => {
-                tab.classList.remove('active');
-            });
-            
-            // Убрать active у всех табов
-            document.querySelectorAll('#terminal .tab').forEach(tab => {
-                tab.classList.remove('active');
-            });
-            
-            // Показать выбранную вкладку
-            document.getElementById(tabName + 'Commands').classList.add('active');
-            
-            // Активировать соответствующий таб
-            document.querySelector(`#terminal .tab[onclick*="${tabName}"]`).classList.add('active');
+        function closeModal(modalId) {
+            document.getElementById(modalId).classList.remove('active');
+        }
+        
+        function openModal(modalId) {
+            document.getElementById(modalId).classList.add('active');
         }
         
         // Серверы
-        function loadServers() {
-            fetch('/api/servers')
-                .then(r => r.json())
-                .then(data => {
-                    servers = data.servers || [];
-                    renderServers();
-                    updateStats();
-                });
-        }
-        
-        function renderServers() {
-            const container = document.getElementById('serversList');
-            if (servers.length === 0) {
-                container.innerHTML = `
-                    <div class="text-center" style="padding: 40px;">
-                        <i class="fas fa-server fa-4x text-muted mb-3"></i>
-                        <h3>Серверы не добавлены</h3>
-                        <p class="text-muted">Добавьте свой первый сервер для начала работы</p>
-                        <button class="btn btn-primary" onclick="openAddServerModal()">
-                            <i class="fas fa-plus"></i> Добавить сервер
-                        </button>
-                    </div>
-                `;
-                return;
-            }
-            
-            container.innerHTML = servers.map((s, i) => `
-                <div class="server-item" style="border: 2px solid ${currentServer === i ? '#667eea' : '#e5e7eb'}; background: ${currentServer === i ? '#f0f5ff' : 'white'};">
-                    <div style="display: flex; justify-content: space-between; align-items: start;">
-                        <div>
-                            <div style="font-weight: 600; margin-bottom: 5px; font-size: 1.1rem;">${s.name}</div>
-                            <div style="font-size: 0.9em; opacity: 0.7;">
-                                <i class="fas fa-user"></i> ${s.user}@
-                                <i class="fas fa-globe"></i> ${s.host}:
-                                <i class="fas fa-network-wired"></i> ${s.port}
-                            </div>
-                        </div>
-                        <div>
-                            <span class="status-dot ${currentServer === i ? 'status-online' : 'status-offline'}"></span>
-                        </div>
-                    </div>
-                    <div style="display: flex; gap: 10px; margin-top: 15px;">
-                        <button class="btn btn-success" style="flex: 1;" onclick="connectToServer(${i})">
-                            <i class="fas fa-plug"></i> ${currentServer === i ? 'Подключено' : 'Подключиться'}
-                        </button>
-                        <button class="btn btn-outline" onclick="testServer(${i})">
-                            <i class="fas fa-play"></i>
-                        </button>
-                        <button class="btn btn-danger" onclick="removeServer(${i})">
-                            <i class="fas fa-trash"></i>
-                        </button>
-                    </div>
-                </div>
-            `).join('');
-        }
-        
-        function connectToServer(index) {
-            currentServer = index;
-            const server = servers[index];
-            
-            addToTerminal(`\\n🔌 Подключение к ${server.name}...`);
-            
-            fetch('/api/connect', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({server_id: index})
-            })
-            .then(r => r.json())
-            .then(data => {
-                if (data.success) {
-                    addToTerminal(`✅ Подключено к ${server.name}\\n`);
-                    document.querySelector('.server-status .status-dot').className = 'status-dot status-online';
-                    document.querySelector('.server-status .status-indicator span:last-child').textContent = `Подключено к ${server.name}`;
-                    document.getElementById('terminalTitle').textContent = `Терминал (${server.name})`;
-                    document.getElementById('commandInput').disabled = false;
-                    document.getElementById('execBtn').disabled = false;
-                    
-                    // Обновить информацию о сервере
-                    updateServerInfo(server);
-                    renderServers();
-                    updateStats();
-                    
-                    // Загрузить список файлов если открыт файловый менеджер
-                    if (document.getElementById('filemanager').classList.contains('active')) {
-                        loadFileList('/');
-                    }
-                    
-                    addRecentActivity('Подключение к серверу', `Подключен к ${server.name}`, 'success');
-                } else {
-                    addToTerminal(`❌ Ошибка: ${data.error}\\n`);
-                    addRecentActivity('Ошибка подключения', data.error, 'danger');
-                }
-            });
-        }
-        
-        function updateServerInfo(server) {
-            document.getElementById('currentServerInfo').innerHTML = `
-                <div style="margin-top: 10px;">
-                    <div><i class="fas fa-server"></i> ${server.name}</div>
-                    <div><i class="fas fa-user"></i> ${server.user}</div>
-                    <div><i class="fas fa-globe"></i> ${server.host}:${server.port}</div>
-                </div>
-            `;
-        }
-        
-        function testServer(index) {
-            const server = servers[index];
-            fetch('/api/test_server', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({server_id: index})
-            })
-            .then(r => r.json())
-            .then(data => {
-                if (data.success) {
-                    alert(`✅ Сервер "${server.name}" доступен!\\nВремя отклика: ${data.ping}ms`);
-                } else {
-                    alert(`❌ Ошибка: ${data.error}`);
-                }
-            });
-        }
-        
-        function testAllServers() {
-            servers.forEach((server, index) => {
-                testServer(index);
-            });
-        }
-        
-        function removeServer(index) {
-            if (confirm(`Удалить сервер "${servers[index].name}"?`)) {
-                fetch('/api/remove_server', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({server_id: index})
-                })
-            .then(r => r.json())
-            .then(data => {
-                if (data.success) {
-                    servers.splice(index, 1);
-                    if (currentServer === index) {
-                        currentServer = null;
-                        document.querySelector('.server-status .status-dot').className = 'status-dot status-offline';
-                        document.querySelector('.server-status .status-indicator span:last-child').textContent = 'Сервер не подключен';
-                        document.getElementById('commandInput').disabled = true;
-                        document.getElementById('execBtn').disabled = true;
-                    }
-                    renderServers();
-                    updateStats();
-                    addRecentActivity('Удаление сервера', `Сервер "${data.name}" удален`, 'warning');
-                }
-            });
-            }
-        }
-        
-        function removeAllServers() {
-            if (servers.length === 0) return;
-            if (confirm(`Удалить все серверы (${servers.length})?`)) {
-                fetch('/api/remove_all_servers', {method: 'POST'})
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.success) {
-                            servers = [];
-                            currentServer = null;
-                            renderServers();
-                            updateStats();
-                            addRecentActivity('Очистка серверов', 'Все серверы удалены', 'danger');
-                        }
-                    });
-            }
-        }
-        
-        // Модальные окна
         function openAddServerModal() {
-            document.getElementById('addServerModal').classList.add('active');
-        }
-        
-        function closeAddServerModal() {
-            document.getElementById('addServerModal').classList.remove('active');
-            // Очистить форму
-            document.getElementById('serverName').value = '';
-            document.getElementById('serverHost').value = '';
-            document.getElementById('serverPort').value = '22';
-            document.getElementById('serverUser').value = '';
-            document.getElementById('serverPassword').value = '';
+            openModal('addServerModal');
         }
         
         function addServer() {
             const server = {
                 name: document.getElementById('serverName').value,
                 host: document.getElementById('serverHost').value,
-                port: document.getElementById('serverPort').value,
+                port: parseInt(document.getElementById('serverPort').value),
                 user: document.getElementById('serverUser').value,
                 password: document.getElementById('serverPassword').value
             };
@@ -1242,9 +874,165 @@ SSH Agent Pro v2.0
             .then(r => r.json())
             .then(data => {
                 if (data.success) {
-                    closeAddServerModal();
-                    loadServers();
-                    addRecentActivity('Добавление сервера', `Сервер "${server.name}" добавлен`, 'success');
+                    closeModal('addServerModal');
+                    
+                    // Добавить сервер в локальный список
+                    servers.push(server);
+                    renderServers();
+                    updateStats();
+                    saveSession();
+                    
+                    // Очистить форму
+                    document.getElementById('serverName').value = '';
+                    document.getElementById('serverHost').value = '';
+                    document.getElementById('serverPort').value = '22';
+                    document.getElementById('serverUser').value = '';
+                    document.getElementById('serverPassword').value = '';
+                    
+                    alert('✅ Сервер добавлен!');
+                } else {
+                    alert('❌ Ошибка: ' + data.error);
+                }
+            });
+        }
+        
+        function loadServers() {
+            fetch('/api/servers')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.servers) {
+                        servers = data.servers;
+                        renderServers();
+                        updateStats();
+                    }
+                });
+        }
+        
+        function renderServers() {
+            const container = document.getElementById('serversList');
+            
+            if (servers.length === 0) {
+                container.innerHTML = `
+                    <div style="text-align: center; padding: 40px;">
+                        <i class="fas fa-server fa-4x" style="color: #9ca3af; margin-bottom: 20px;"></i>
+                        <h3 style="color: #6b7280; margin-bottom: 10px;">Серверы не добавлены</h3>
+                        <p style="color: #9ca3af;">Добавьте свой первый сервер для начала работы</p>
+                    </div>
+                `;
+                return;
+            }
+            
+            container.innerHTML = `
+                <div class="servers-grid">
+                    ${servers.map((server, index) => `
+                        <div class="server-card ${currentServer === index ? 'active' : ''}">
+                            <div class="server-name">
+                                <i class="fas fa-server"></i> ${server.name}
+                                ${currentServer === index ? '<span style="color: var(--success); margin-left: 10px;"><i class="fas fa-plug"></i> Подключен</span>' : ''}
+                            </div>
+                            <div class="server-details">
+                                <div><i class="fas fa-user"></i> ${server.user}</div>
+                                <div><i class="fas fa-globe"></i> ${server.host}:${server.port}</div>
+                            </div>
+                            <div class="server-actions">
+                                <button class="btn ${currentServer === index ? 'btn-success' : 'btn-primary'}" onclick="connectToServer(${index})" style="flex: 1;">
+                                    <i class="fas fa-plug"></i> ${currentServer === index ? 'Подключено' : 'Подключиться'}
+                                </button>
+                                <button class="btn btn-danger" onclick="removeServer(${index})">
+                                    <i class="fas fa-trash"></i>
+                                </button>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+        }
+        
+        function connectToServer(index) {
+            if (currentServer === index) {
+                // Уже подключен, можно отключить
+                if (confirm('Отключиться от сервера?')) {
+                    disconnectFromServer();
+                }
+                return;
+            }
+            
+            currentServer = index;
+            const server = servers[index];
+            
+            addToTerminal(`\n🔌 Подключение к ${server.name}...`);
+            
+            fetch('/api/connect', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({server_id: index})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    addToTerminal(`✅ Успешно подключено к ${server.name}\n`);
+                    updateConnectionStatus(true);
+                    document.getElementById('commandInput').disabled = false;
+                    document.getElementById('execBtn').disabled = false;
+                    renderServers();
+                    saveSession();
+                    
+                    // Загрузить файлы если открыт файловый менеджер
+                    if (document.getElementById('filemanager').classList.contains('active')) {
+                        loadFiles('/');
+                    }
+                } else {
+                    addToTerminal(`❌ Ошибка подключения: ${data.error}\n`);
+                    currentServer = null;
+                }
+            });
+        }
+        
+        function disconnectFromServer() {
+            fetch('/api/disconnect', {
+                method: 'POST'
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    addToTerminal('🔌 Отключено от сервера\n');
+                    currentServer = null;
+                    updateConnectionStatus(false);
+                    document.getElementById('commandInput').disabled = true;
+                    document.getElementById('execBtn').disabled = true;
+                    renderServers();
+                    saveSession();
+                }
+            });
+        }
+        
+        function removeServer(index) {
+            if (!confirm(`Удалить сервер "${servers[index].name}"?`)) {
+                return;
+            }
+            
+            if (currentServer === index) {
+                disconnectFromServer();
+            }
+            
+            fetch('/api/remove_server', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({server_id: index})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    servers.splice(index, 1);
+                    if (currentServer === index) {
+                        currentServer = null;
+                        updateConnectionStatus(false);
+                    }
+                    renderServers();
+                    updateStats();
+                    saveSession();
+                } else {
+                    alert('Ошибка: ' + data.error);
                 }
             });
         }
@@ -1252,64 +1040,13 @@ SSH Agent Pro v2.0
         // Терминал
         function addToTerminal(text) {
             const output = document.getElementById('terminalOutput');
-            output.textContent += '\\n' + text;
-            const terminal = document.querySelector('#terminal .terminal-body');
+            output.textContent += text;
+            const terminal = document.querySelector('.terminal-body');
             terminal.scrollTop = terminal.scrollHeight;
         }
         
-        function executeCommand() {
-            const input = document.getElementById('commandInput');
-            const command = input.value.trim();
-            
-            if (!command) return;
-            
-            addToTerminal(`\\n$ ${command}`);
-            input.value = '';
-            
-            fetch('/api/execute', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({command})
-            })
-            .then(r => r.json())
-            .then(data => {
-                if (data.success) {
-                    addToTerminal(data.output || '(пусто)');
-                    commandsExecuted++;
-                    updateStats();
-                    addRecentActivity('Выполнение команды', command, 'primary');
-                } else {
-                    addToTerminal(`❌ Ошибка: ${data.error}`);
-                }
-            });
-        }
-        
-        function executeQuickCommand() {
-            const input = document.getElementById('quickCommand');
-            const command = input.value.trim();
-            
-            if (!command) return;
-            
-            if (currentServer === null) {
-                alert('Сначала подключитесь к серверу');
-                return;
-            }
-            
-            fetch('/api/execute', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({command})
-            })
-            .then(r => r.json())
-            .then(data => {
-                if (data.success) {
-                    addToTerminal(`\\n$ ${command}\\n${data.output || '(пусто)'}`);
-                    commandsExecuted++;
-                    updateStats();
-                }
-            });
-            
-            input.value = '';
+        function clearTerminal() {
+            document.getElementById('terminalOutput').textContent = '';
         }
         
         function insertCommand(command) {
@@ -1317,88 +1054,89 @@ SSH Agent Pro v2.0
             document.getElementById('commandInput').focus();
         }
         
-        function clearTerminal() {
-            document.getElementById('terminalOutput').textContent = '';
-        }
-        
-        function saveTerminalLog() {
-            const content = document.getElementById('terminalOutput').textContent;
-            const blob = new Blob([content], {type: 'text/plain'});
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `terminal_log_${new Date().toISOString().slice(0,10)}.txt`;
-            a.click();
-            URL.revokeObjectURL(url);
-            addRecentActivity('Сохранение лога', 'Терминальный лог сохранен', 'success');
-        }
-        
-        // Файловый менеджер
-        function loadFileList(path) {
-            if (currentServer === null) {
-                document.getElementById('fileList').innerHTML = `
-                    <div class="text-center" style="padding: 40px; width: 100%;">
-                        <i class="fas fa-server fa-4x text-muted mb-3"></i>
-                        <h3>Сервер не подключен</h3>
-                        <p class="text-muted">Подключитесь к серверу для работы с файлами</p>
-                    </div>
-                `;
-                return;
-            }
+        function executeCommand() {
+            const input = document.getElementById('commandInput');
+            const command = input.value.trim();
             
-            document.getElementById('fileManagerLoading').style.display = 'block';
-            document.getElementById('fileList').innerHTML = '';
+            if (!command || currentServer === null) return;
             
-            fetch('/api/list_files', {
+            addToTerminal(`\n$ ${command}\n`);
+            
+            fetch('/api/execute', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({path: path})
+                body: JSON.stringify({command})
             })
             .then(r => r.json())
             .then(data => {
-                document.getElementById('fileManagerLoading').style.display = 'none';
-                
+                if (data.success) {
+                    addToTerminal(data.output + '\n');
+                    commandsExecuted++;
+                    updateStats();
+                    saveSession();
+                } else {
+                    addToTerminal(`❌ Ошибка: ${data.error}\n`);
+                }
+                input.value = '';
+            });
+        }
+        
+        // Файловый менеджер
+        function openUploadModal() {
+            if (currentServer === null) {
+                alert('Сначала подключитесь к серверу');
+                return;
+            }
+            document.getElementById('uploadPath').value = currentPath;
+            openModal('uploadModal');
+        }
+        
+        function refreshFiles() {
+            if (currentServer === null) {
+                alert('Сначала подключитесь к серверу');
+                return;
+            }
+            loadFiles(currentPath);
+        }
+        
+        function loadFiles(path) {
+            fetch('/api/list_files', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path})
+            })
+            .then(r => r.json())
+            .then(data => {
                 if (data.success) {
                     currentPath = data.current_path;
                     document.getElementById('currentPath').textContent = currentPath;
-                    updateBreadcrumbs();
                     
                     const files = data.files || [];
-                    filesProcessed += files.length;
+                    filesProcessed = files.length;
+                    updateStats();
+                    
+                    const fileList = document.getElementById('fileList');
                     
                     if (files.length === 0) {
-                        document.getElementById('fileList').innerHTML = `
-                            <div class="text-center" style="padding: 40px; width: 100%;">
-                                <i class="fas fa-folder-open fa-4x text-muted mb-3"></i>
-                                <h3>Папка пуста</h3>
-                                <p class="text-muted">Добавьте файлы или создайте новую папку</p>
-                            </div>
-                        `;
+                        fileList.innerHTML = '<p style="text-align: center; color: #9ca3af; padding: 40px;">Папка пуста</p>';
                         return;
                     }
                     
-                    document.getElementById('fileList').innerHTML = files.map(file => `
-                        <div class="file-item" onclick="handleFileClick('${file.name}', ${file.is_dir}, '${file.permissions}')">
-                            <div class="file-icon">
-                                ${file.is_dir ? '<i class="fas fa-folder"></i>' : getFileIcon(file.name)}
-                            </div>
-                            <div class="file-name">${file.name}</div>
-                            ${!file.is_dir ? `<div class="file-size">${formatFileSize(file.size)}</div>` : ''}
-                            <div style="font-size: 0.8rem; color: #6b7280; margin-top: 5px;">
-                                ${file.permissions}
-                            </div>
-                        </div>
-                    `).join('');
-                    
-                    updateStats();
-                } else {
-                    document.getElementById('fileList').innerHTML = `
-                        <div class="text-center text-danger" style="padding: 40px;">
-                            <i class="fas fa-exclamation-triangle fa-3x mb-3"></i>
-                            <h3>Ошибка</h3>
-                            <p>${data.error}</p>
+                    fileList.innerHTML = `
+                        <div class="file-list">
+                            ${files.map(file => `
+                                <div class="file-item" onclick="handleFileClick('${file.name}', ${file.is_dir})">
+                                    <div class="file-icon">
+                                        ${file.is_dir ? '<i class="fas fa-folder"></i>' : getFileIcon(file.name)}
+                                    </div>
+                                    <div class="file-name">${file.name}</div>
+                                    ${!file.is_dir ? `<div style="font-size: 0.8rem; color: #6b7280;">${formatFileSize(file.size)}</div>` : ''}
+                                </div>
+                            `).join('')}
                         </div>
                     `;
+                } else {
+                    alert('Ошибка: ' + data.error);
                 }
             });
         }
@@ -1408,26 +1146,12 @@ SSH Agent Pro v2.0
             const icons = {
                 'txt': 'fa-file-alt',
                 'pdf': 'fa-file-pdf',
-                'jpg': 'fa-file-image',
-                'jpeg': 'fa-file-image',
-                'png': 'fa-file-image',
-                'gif': 'fa-file-image',
-                'zip': 'fa-file-archive',
-                'rar': 'fa-file-archive',
-                'tar': 'fa-file-archive',
-                'gz': 'fa-file-archive',
-                'py': 'fa-file-code',
-                'js': 'fa-file-code',
-                'html': 'fa-file-code',
-                'css': 'fa-file-code',
-                'json': 'fa-file-code',
-                'xml': 'fa-file-code',
-                'sql': 'fa-file-code',
-                'sh': 'fa-file-code',
-                'mp3': 'fa-file-audio',
-                'mp4': 'fa-file-video',
-                'avi': 'fa-file-video',
-                'mkv': 'fa-file-video'
+                'jpg': 'fa-file-image', 'jpeg': 'fa-file-image', 'png': 'fa-file-image', 'gif': 'fa-file-image',
+                'zip': 'fa-file-archive', 'rar': 'fa-file-archive', 'tar': 'fa-file-archive', 'gz': 'fa-file-archive',
+                'py': 'fa-file-code', 'js': 'fa-file-code', 'html': 'fa-file-code', 'css': 'fa-file-code',
+                'json': 'fa-file-code', 'xml': 'fa-file-code', 'sh': 'fa-file-code',
+                'mp3': 'fa-file-audio', 'wav': 'fa-file-audio',
+                'mp4': 'fa-file-video', 'avi': 'fa-file-video', 'mkv': 'fa-file-video'
             };
             return `<i class="fas ${icons[ext] || 'fa-file'}"></i>`;
         }
@@ -1440,136 +1164,24 @@ SSH Agent Pro v2.0
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
         
-        function updateBreadcrumbs() {
-            const parts = currentPath.split('/').filter(p => p);
-            let breadcrumbs = '<span onclick="loadFileList(\'/\')">/</span>';
-            let current = '';
-            
-            parts.forEach((part, index) => {
-                current += '/' + part;
-                breadcrumbs += ` / <span onclick="loadFileList('${current}')">${part}</span>`;
-            });
-            
-            document.getElementById('breadcrumbs').innerHTML = breadcrumbs;
-        }
-        
-        function handleFileClick(filename, isDir, permissions) {
-            const fullPath = currentPath.endsWith('/') ? currentPath + filename : currentPath + '/' + filename;
-            
+        function handleFileClick(filename, isDir) {
             if (isDir) {
-                loadFileList(fullPath);
+                const newPath = currentPath.endsWith('/') ? currentPath + filename : currentPath + '/' + filename;
+                loadFiles(newPath);
             } else {
-                // Показать меню для файла
-                const actions = [
-                    {icon: 'fa-edit', text: 'Редактировать', action: `editFile('${fullPath}')`},
-                    {icon: 'fa-download', text: 'Скачать', action: `downloadFileDirect('${fullPath}')`},
-                    {icon: 'fa-trash', text: 'Удалить', action: `deleteFile('${fullPath}')`},
-                    {icon: 'fa-copy', text: 'Копировать путь', action: `copyToClipboard('${fullPath}')`}
-                ];
-                
-                const menuHtml = actions.map(a => `
-                    <div class="nav-item" onclick="${a.action}">
-                        <i class="fas ${a.icon}"></i> ${a.text}
-                    </div>
-                `).join('');
-                
-                // Создать временное модальное окно
-                const modal = document.createElement('div');
-                modal.className = 'modal active';
-                modal.innerHTML = `
-                    <div class="modal-content">
-                        <div class="modal-header">
-                            <h2><i class="fas fa-file"></i> ${filename}</h2>
-                            <button class="modal-close" onclick="this.parentElement.parentElement.remove()">&times;</button>
-                        </div>
-                        <div class="mb-3">
-                            <p><strong>Путь:</strong> ${fullPath}</p>
-                            <p><strong>Права:</strong> ${permissions}</p>
-                        </div>
-                        <div class="nav-section">
-                            ${menuHtml}
-                        </div>
-                    </div>
+                // Для файла показываем меню действий
+                const fullPath = currentPath.endsWith('/') ? currentPath + filename : currentPath + '/' + filename;
+                const actions = `
+                    <button class="btn btn-primary" onclick="downloadFile('${fullPath}')">
+                        <i class="fas fa-download"></i> Скачать
+                    </button>
+                    <button class="btn btn-danger" onclick="deleteFile('${fullPath}')">
+                        <i class="fas fa-trash"></i> Удалить
+                    </button>
                 `;
-                document.body.appendChild(modal);
+                
+                alert(`Файл: ${filename}\n\nВыберите действие:\n\n${actions}`);
             }
-        }
-        
-        function editFile(path) {
-            fetch('/api/get_file', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({path: path})
-            })
-            .then(r => r.json())
-            .then(data => {
-                if (data.success) {
-                    document.getElementById('editFilePath').value = path;
-                    document.getElementById('editFileContent').value = data.content;
-                    document.getElementById('editFileModal').classList.add('active');
-                    // Закрыть предыдущее модальное окно
-                    document.querySelectorAll('.modal').forEach(m => {
-                        if (m.id !== 'editFileModal') m.remove();
-                    });
-                } else {
-                    alert(`Ошибка: ${data.error}`);
-                }
-            });
-        }
-        
-        function closeEditFileModal() {
-            document.getElementById('editFileModal').classList.remove('active');
-        }
-        
-        function saveFile() {
-            const path = document.getElementById('editFilePath').value;
-            const content = document.getElementById('editFileContent').value;
-            
-            fetch('/api/save_file', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({path: path, content: content})
-            })
-            .then(r => r.json())
-            .then(data => {
-                if (data.success) {
-                    alert('Файл успешно сохранен');
-                    closeEditFileModal();
-                    addRecentActivity('Сохранение файла', path, 'success');
-                } else {
-                    alert(`Ошибка: ${data.error}`);
-                }
-            });
-        }
-        
-        function downloadFileDirect(path) {
-            window.open(`/api/download_file?path=${encodeURIComponent(path)}`, '_blank');
-            addRecentActivity('Скачивание файла', path, 'primary');
-        }
-        
-        function deleteFile(path) {
-            if (confirm(`Удалить файл "${path.split('/').pop()}"?`)) {
-                fetch('/api/delete_file', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({path: path})
-                })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.success) {
-                        loadFileList(currentPath);
-                        addRecentActivity('Удаление файла', path, 'danger');
-                    } else {
-                        alert(`Ошибка: ${data.error}`);
-                    }
-                });
-            }
-        }
-        
-        function copyToClipboard(text) {
-            navigator.clipboard.writeText(text).then(() => {
-                alert('Путь скопирован в буфер обмена');
-            });
         }
         
         function goUp() {
@@ -1577,7 +1189,7 @@ SSH Agent Pro v2.0
             const parts = currentPath.split('/').filter(p => p);
             parts.pop();
             const newPath = '/' + parts.join('/');
-            loadFileList(newPath || '/');
+            loadFiles(newPath || '/');
         }
         
         function createFolder() {
@@ -1587,32 +1199,17 @@ SSH Agent Pro v2.0
                 fetch('/api/create_folder', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({path: path})
+                    body: JSON.stringify({path})
                 })
                 .then(r => r.json())
                 .then(data => {
                     if (data.success) {
-                        loadFileList(currentPath);
-                        addRecentActivity('Создание папки', path, 'success');
+                        loadFiles(currentPath);
                     } else {
-                        alert(`Ошибка: ${data.error}`);
+                        alert('Ошибка: ' + data.error);
                     }
                 });
             }
-        }
-        
-        function refreshFileManager() {
-            loadFileList(currentPath);
-        }
-        
-        function openUploadModal() {
-            document.getElementById('uploadPath').value = currentPath;
-            document.getElementById('uploadModal').classList.add('active');
-        }
-        
-        function closeUploadModal() {
-            document.getElementById('uploadModal').classList.remove('active');
-            document.getElementById('fileUpload').value = '';
         }
         
         function uploadFiles() {
@@ -1638,21 +1235,55 @@ SSH Agent Pro v2.0
             .then(data => {
                 if (data.success) {
                     alert(`Загружено ${data.uploaded} файлов`);
-                    closeUploadModal();
-                    loadFileList(currentPath);
-                    addRecentActivity('Загрузка файлов', `Загружено ${data.uploaded} файлов в ${path}`, 'success');
+                    closeModal('uploadModal');
+                    loadFiles(currentPath);
                 } else {
-                    alert(`Ошибка: ${data.error}`);
+                    alert('Ошибка: ' + data.error);
+                }
+            });
+        }
+        
+        function downloadFile(path) {
+            window.open(`/api/download_file?path=${encodeURIComponent(path)}`, '_blank');
+        }
+        
+        function deleteFile(path) {
+            if (!confirm(`Удалить файл "${path.split('/').pop()}"?`)) return;
+            
+            fetch('/api/delete_file', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    loadFiles(currentPath);
+                } else {
+                    alert('Ошибка: ' + data.error);
                 }
             });
         }
         
         function deleteSelected() {
-            // Реализация выбора файлов (упрощенная)
-            alert('Для удаления файлов используйте меню файла (клик по файлу)');
+            if (selectedFiles.size === 0) return;
+            // Реализация удаления выбранных файлов
         }
         
-        // Статистика
+        // Вспомогательные функции
+        function updateConnectionStatus(connected) {
+            const statusDot = document.querySelector('.status-dot');
+            const statusText = document.getElementById('statusText');
+            
+            if (connected) {
+                statusDot.className = 'status-dot status-online';
+                statusText.textContent = 'Подключено к серверу';
+            } else {
+                statusDot.className = 'status-dot status-offline';
+                statusText.textContent = 'Сервер не подключен';
+            }
+        }
+        
         function updateStats() {
             document.getElementById('serversCount').textContent = servers.length;
             document.getElementById('activeConnections').textContent = currentServer !== null ? 1 : 0;
@@ -1660,250 +1291,188 @@ SSH Agent Pro v2.0
             document.getElementById('filesCount').textContent = filesProcessed;
         }
         
-        // Последние действия
-        function loadRecentActivities() {
-            const activities = JSON.parse(localStorage.getItem('ssh_agent_activities') || '[]');
-            const container = document.getElementById('recentActivities');
-            
-            if (activities.length === 0) {
-                container.innerHTML = '<p class="text-muted text-center">Нет последних действий</p>';
-                return;
-            }
-            
-            container.innerHTML = activities.slice(0, 10).map(act => `
-                <div style="padding: 10px; border-bottom: 1px solid #e5e7eb;">
-                    <div style="display: flex; justify-content: space-between;">
-                        <strong>${act.title}</strong>
-                        <span style="color: ${getStatusColor(act.status)};">
-                            <i class="fas fa-circle" style="font-size: 8px;"></i>
-                        </span>
-                    </div>
-                    <div style="color: #6b7280; font-size: 0.9rem;">${act.description}</div>
-                    <div style="color: #9ca3af; font-size: 0.8rem;">${new Date(act.timestamp).toLocaleString()}</div>
-                </div>
-            `).join('');
-        }
-        
-        function addRecentActivity(title, description, status) {
-            const activities = JSON.parse(localStorage.getItem('ssh_agent_activities') || '[]');
-            activities.unshift({
-                title,
-                description,
-                status,
-                timestamp: new Date().toISOString()
-            });
-            
-            // Храним только последние 50 действий
-            if (activities.length > 50) {
-                activities.pop();
-            }
-            
-            localStorage.setItem('ssh_agent_activities', JSON.stringify(activities));
-            loadRecentActivities();
-        }
-        
-        function getStatusColor(status) {
-            const colors = {
-                'success': '#10b981',
-                'danger': '#ef4444',
-                'warning': '#f59e0b',
-                'primary': '#667eea',
-                'info': '#3b82f6'
+        function saveSession() {
+            const sessionData = {
+                servers: servers,
+                currentServer: currentServer,
+                commandsExecuted: commandsExecuted,
+                filesProcessed: filesProcessed
             };
-            return colors[status] || '#6b7280';
+            localStorage.setItem('ssh_agent_session', JSON.stringify(sessionData));
         }
     </script>
 </body>
 </html>
 """
 
-# ============ FLASK ROUTES ============
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
+# ============ API ENDPOINTS ============
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return HTML_TEMPLATE
 
-@app.route('/api/servers', methods=['GET', 'POST'])
-def servers_api():
-    session_id = session.get('session_id', 'default')
+@app.get("/api/servers")
+async def get_servers(request: Request):
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        session_id = secrets.token_hex(16)
     
-    if session_id not in user_sessions:
-        user_sessions[session_id] = {'servers': [], 'current_connection': None, 'sftp': None}
+    if session_id not in web_sessions:
+        web_sessions[session_id] = {'servers': [], 'current_connection': None, 'sftp': None}
     
-    if request.method == 'POST':
-        server = request.json
-        user_sessions[session_id]['servers'].append(server)
-        return jsonify({'success': True})
-    
-    return jsonify({'servers': user_sessions[session_id]['servers']})
+    response = JSONResponse(content={'servers': web_sessions[session_id]['servers']})
+    response.set_cookie(key="session_id", value=session_id)
+    return response
 
-@app.route('/api/connect', methods=['POST'])
-def connect_api():
-    session_id = session.get('session_id', 'default')
-    server_id = request.json.get('server_id')
+@app.post("/api/servers")
+async def add_server(server: Server, request: Request):
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        session_id = secrets.token_hex(16)
     
-    if session_id not in user_sessions:
-        return jsonify({'success': False, 'error': 'Session not found'})
+    if session_id not in web_sessions:
+        web_sessions[session_id] = {'servers': [], 'current_connection': None, 'sftp': None}
     
-    if server_id >= len(user_sessions[session_id]['servers']):
-        return jsonify({'success': False, 'error': 'Server not found'})
+    web_sessions[session_id]['servers'].append(server.dict())
     
-    server = user_sessions[session_id]['servers'][server_id]
+    response = JSONResponse(content={'success': True})
+    response.set_cookie(key="session_id", value=session_id)
+    return response
+
+@app.post("/api/connect")
+async def connect_server(request: Request):
+    session_id = request.cookies.get("session_id")
+    if not session_id or session_id not in web_sessions:
+        return JSONResponse(content={'success': False, 'error': 'Session not found'})
+    
+    data = await request.json()
+    server_id = data.get('server_id')
+    
+    if server_id >= len(web_sessions[session_id]['servers']):
+        return JSONResponse(content={'success': False, 'error': 'Server not found'})
+    
+    server = web_sessions[session_id]['servers'][server_id]
     
     try:
-        # Закрываем предыдущее соединение если есть
-        if user_sessions[session_id]['current_connection']:
+        # Закрываем предыдущие соединения
+        if web_sessions[session_id]['current_connection']:
             try:
-                user_sessions[session_id]['current_connection'].close()
+                web_sessions[session_id]['current_connection'].close()
             except:
                 pass
         
-        if user_sessions[session_id].get('sftp'):
+        if web_sessions[session_id].get('sftp'):
             try:
-                user_sessions[session_id]['sftp'].close()
+                web_sessions[session_id]['sftp'].close()
             except:
                 pass
         
-        # SSH соединение
-        ssh = paramiko.SSHClient()
+        # Создаем новое SSH соединение
+        ssh = SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(
             hostname=server['host'],
-            port=int(server['port']),
+            port=server['port'],
             username=server['user'],
             password=server['password'],
             timeout=10
         )
         
-        # SFTP соединение
+        # Создаем SFTP соединение
         sftp = ssh.open_sftp()
         
-        user_sessions[session_id]['current_connection'] = ssh
-        user_sessions[session_id]['sftp'] = sftp
-        user_sessions[session_id]['current_server'] = server_id
+        web_sessions[session_id]['current_connection'] = ssh
+        web_sessions[session_id]['sftp'] = sftp
         
-        return jsonify({'success': True})
+        return JSONResponse(content={'success': True})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return JSONResponse(content={'success': False, 'error': str(e)})
 
-@app.route('/api/execute', methods=['POST'])
-def execute_api():
-    session_id = session.get('session_id', 'default')
-    command = request.json.get('command')
-    
-    if session_id not in user_sessions or not user_sessions[session_id]['current_connection']:
-        return jsonify({'success': False, 'error': 'Not connected'})
+@app.post("/api/disconnect")
+async def disconnect_server(request: Request):
+    session_id = request.cookies.get("session_id")
+    if not session_id or session_id not in web_sessions:
+        return JSONResponse(content={'success': False, 'error': 'Session not found'})
     
     try:
-        ssh = user_sessions[session_id]['current_connection']
+        if web_sessions[session_id].get('sftp'):
+            web_sessions[session_id]['sftp'].close()
+            web_sessions[session_id]['sftp'] = None
+        
+        if web_sessions[session_id].get('current_connection'):
+            web_sessions[session_id]['current_connection'].close()
+            web_sessions[session_id]['current_connection'] = None
+        
+        return JSONResponse(content={'success': True})
+    except Exception as e:
+        return JSONResponse(content={'success': False, 'error': str(e)})
+
+@app.post("/api/execute")
+async def execute_command(request: Request):
+    session_id = request.cookies.get("session_id")
+    if not session_id or session_id not in web_sessions:
+        return JSONResponse(content={'success': False, 'error': 'Session not found'})
+    
+    data = await request.json()
+    command = data.get('command')
+    
+    if not web_sessions[session_id].get('current_connection'):
+        return JSONResponse(content={'success': False, 'error': 'Not connected'})
+    
+    try:
+        ssh = web_sessions[session_id]['current_connection']
         stdin, stdout, stderr = ssh.exec_command(command)
         output = stdout.read().decode() + stderr.read().decode()
-        return jsonify({'success': True, 'output': output})
+        return JSONResponse(content={'success': True, 'output': output})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return JSONResponse(content={'success': False, 'error': str(e)})
 
-@app.route('/api/test_server', methods=['POST'])
-def test_server_api():
-    session_id = session.get('session_id', 'default')
-    server_id = request.json.get('server_id')
+@app.post("/api/remove_server")
+async def remove_server_api(request: Request):
+    session_id = request.cookies.get("session_id")
+    if not session_id or session_id not in web_sessions:
+        return JSONResponse(content={'success': False, 'error': 'Session not found'})
     
-    if session_id not in user_sessions:
-        return jsonify({'success': False, 'error': 'Session not found'})
+    data = await request.json()
+    server_id = data.get('server_id')
     
-    if server_id >= len(user_sessions[session_id]['servers']):
-        return jsonify({'success': False, 'error': 'Server not found'})
+    if server_id >= len(web_sessions[session_id]['servers']):
+        return JSONResponse(content={'success': False, 'error': 'Server not found'})
     
-    server = user_sessions[session_id]['servers'][server_id]
-    
-    try:
-        import time
-        start_time = time.time()
-        
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            hostname=server['host'],
-            port=int(server['port']),
-            username=server['user'],
-            password=server['password'],
-            timeout=5
-        )
-        ssh.close()
-        
-        ping_time = int((time.time() - start_time) * 1000)
-        return jsonify({'success': True, 'ping': ping_time})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/remove_server', methods=['POST'])
-def remove_server_api():
-    session_id = session.get('session_id', 'default')
-    server_id = request.json.get('server_id')
-    
-    if session_id not in user_sessions:
-        return jsonify({'success': False, 'error': 'Session not found'})
-    
-    if server_id >= len(user_sessions[session_id]['servers']):
-        return jsonify({'success': False, 'error': 'Server not found'})
-    
-    server = user_sessions[session_id]['servers'][server_id]
-    del user_sessions[session_id]['servers'][server_id]
-    
-    # Если удаляем текущий сервер
-    if user_sessions[session_id].get('current_server') == server_id:
-        if user_sessions[session_id].get('sftp'):
-            try:
-                user_sessions[session_id]['sftp'].close()
-            except:
-                pass
-        if user_sessions[session_id].get('current_connection'):
-            try:
-                user_sessions[session_id]['current_connection'].close()
-            except:
-                pass
-        user_sessions[session_id]['current_connection'] = None
-        user_sessions[session_id]['sftp'] = None
-        user_sessions[session_id]['current_server'] = None
-    
-    return jsonify({'success': True, 'name': server['name']})
-
-@app.route('/api/remove_all_servers', methods=['POST'])
-def remove_all_servers_api():
-    session_id = session.get('session_id', 'default')
-    
-    if session_id not in user_sessions:
-        return jsonify({'success': False, 'error': 'Session not found'})
-    
-    # Закрываем соединения
-    if user_sessions[session_id].get('sftp'):
+    # Если удаляем текущий сервер, закрываем соединения
+    if web_sessions[session_id].get('current_connection'):
         try:
-            user_sessions[session_id]['sftp'].close()
+            web_sessions[session_id]['current_connection'].close()
         except:
             pass
-    if user_sessions[session_id].get('current_connection'):
+        web_sessions[session_id]['current_connection'] = None
+    
+    if web_sessions[session_id].get('sftp'):
         try:
-            user_sessions[session_id]['current_connection'].close()
+            web_sessions[session_id]['sftp'].close()
         except:
             pass
+        web_sessions[session_id]['sftp'] = None
     
-    # Очищаем серверы
-    user_sessions[session_id]['servers'] = []
-    user_sessions[session_id]['current_connection'] = None
-    user_sessions[session_id]['sftp'] = None
-    user_sessions[session_id]['current_server'] = None
+    # Удаляем сервер из списка
+    web_sessions[session_id]['servers'].pop(server_id)
     
-    return jsonify({'success': True})
+    return JSONResponse(content={'success': True})
 
 # ============ ФАЙЛОВЫЙ МЕНЕДЖЕР API ============
-@app.route('/api/list_files', methods=['POST'])
-def list_files_api():
-    session_id = session.get('session_id', 'default')
-    path = request.json.get('path', '/')
+@app.post("/api/list_files")
+async def list_files(request: Request):
+    session_id = request.cookies.get("session_id")
+    if not session_id or session_id not in web_sessions:
+        return JSONResponse(content={'success': False, 'error': 'Session not found'})
     
-    if session_id not in user_sessions or not user_sessions[session_id].get('sftp'):
-        return jsonify({'success': False, 'error': 'Not connected'})
+    data = await request.json()
+    path = data.get('path', '/')
+    
+    if not web_sessions[session_id].get('sftp'):
+        return JSONResponse(content={'success': False, 'error': 'Not connected'})
     
     try:
-        sftp = user_sessions[session_id]['sftp']
+        sftp = web_sessions[session_id]['sftp']
         
         # Нормализуем путь
         if not path.startswith('/'):
@@ -1911,87 +1480,83 @@ def list_files_api():
         
         files = []
         for item in sftp.listdir_attr(path):
+            is_dir = paramiko.sftp_client.SFTPAttributes._from_dict({'st_mode': item.st_mode}).__str__().startswith('d')
             files.append({
                 'name': item.filename,
                 'size': item.st_size,
-                'permissions': paramiko.sftp_client.SFTPAttributes._from_dict({'st_mode': item.st_mode}).__str__(),
-                'is_dir': paramiko.sftp_client.SFTPAttributes._from_dict({'st_mode': item.st_mode}).__str__().startswith('d')
+                'is_dir': is_dir
             })
         
-        # Сортируем: сначала папки, потом файлы
+        # Сортируем: папки сначала
         files.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
         
-        return jsonify({
+        return JSONResponse(content={
             'success': True,
             'files': files,
             'current_path': path
         })
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return JSONResponse(content={'success': False, 'error': str(e)})
 
-@app.route('/api/get_file', methods=['POST'])
-def get_file_api():
-    session_id = session.get('session_id', 'default')
-    path = request.json.get('path')
+@app.post("/api/create_folder")
+async def create_folder_api(request: Request):
+    session_id = request.cookies.get("session_id")
+    if not session_id or session_id not in web_sessions:
+        return JSONResponse(content={'success': False, 'error': 'Session not found'})
     
-    if session_id not in user_sessions or not user_sessions[session_id].get('sftp'):
-        return jsonify({'success': False, 'error': 'Not connected'})
+    data = await request.json()
+    path = data.get('path')
+    
+    if not web_sessions[session_id].get('sftp'):
+        return JSONResponse(content={'success': False, 'error': 'Not connected'})
     
     try:
-        sftp = user_sessions[session_id]['sftp']
-        
-        # Проверяем размер файла (не более 5MB)
-        file_attr = sftp.stat(path)
-        if file_attr.st_size > 5 * 1024 * 1024:
-            return jsonify({'success': False, 'error': 'File too large (max 5MB)'})
-        
-        # Читаем файл
-        with sftp.open(path, 'r') as f:
-            content = f.read().decode('utf-8', errors='ignore')
-        
-        return jsonify({'success': True, 'content': content})
-    except UnicodeDecodeError:
-        return jsonify({'success': False, 'error': 'File is not text (binary)'})
+        sftp = web_sessions[session_id]['sftp']
+        sftp.mkdir(path)
+        return JSONResponse(content={'success': True})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return JSONResponse(content={'success': False, 'error': str(e)})
 
-@app.route('/api/save_file', methods=['POST'])
-def save_file_api():
-    session_id = session.get('session_id', 'default')
-    path = request.json.get('path')
-    content = request.json.get('content')
+@app.post("/api/upload_files")
+async def upload_files_api(
+    request: Request,
+    path: str = Form(...),
+    files: List[UploadFile] = File(...)
+):
+    session_id = request.cookies.get("session_id")
+    if not session_id or session_id not in web_sessions:
+        return JSONResponse(content={'success': False, 'error': 'Session not found'})
     
-    if session_id not in user_sessions or not user_sessions[session_id].get('sftp'):
-        return jsonify({'success': False, 'error': 'Not connected'})
+    if not web_sessions[session_id].get('sftp'):
+        return JSONResponse(content={'success': False, 'error': 'Not connected'})
     
     try:
-        sftp = user_sessions[session_id]['sftp']
+        sftp = web_sessions[session_id]['sftp']
+        uploaded = 0
         
-        # Создаем бекап
-        backup_path = path + '.bak'
-        try:
-            sftp.rename(path, backup_path)
-        except:
-            pass
+        for file in files:
+            if file.filename:
+                file_path = path.rstrip('/') + '/' + file.filename
+                contents = await file.read()
+                with sftp.open(file_path, 'wb') as f:
+                    f.write(contents)
+                uploaded += 1
         
-        # Сохраняем файл
-        with sftp.open(path, 'w') as f:
-            f.write(content)
-        
-        return jsonify({'success': True})
+        return JSONResponse(content={'success': True, 'uploaded': uploaded})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return JSONResponse(content={'success': False, 'error': str(e)})
 
-@app.route('/api/download_file', methods=['GET'])
-def download_file_api():
-    session_id = session.get('session_id', 'default')
-    path = request.args.get('path')
+@app.get("/api/download_file")
+async def download_file_api(path: str, request: Request):
+    session_id = request.cookies.get("session_id")
+    if not session_id or session_id not in web_sessions:
+        return JSONResponse(content={'success': False, 'error': 'Session not found'})
     
-    if session_id not in user_sessions or not user_sessions[session_id].get('sftp'):
-        return jsonify({'success': False, 'error': 'Not connected'})
+    if not web_sessions[session_id].get('sftp'):
+        return JSONResponse(content={'success': False, 'error': 'Not connected'})
     
     try:
-        sftp = user_sessions[session_id]['sftp']
+        sftp = web_sessions[session_id]['sftp']
         
         # Читаем файл
         with sftp.open(path, 'rb') as f:
@@ -2004,131 +1569,68 @@ def download_file_api():
         
         filename = path.split('/')[-1]
         
-        return send_file(
+        return StreamingResponse(
             BytesIO(file_data),
-            mimetype=mime_type,
-            as_attachment=True,
-            download_name=filename
+            media_type=mime_type,
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'}
         )
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return JSONResponse(content={'success': False, 'error': str(e)})
 
-@app.route('/api/delete_file', methods=['POST'])
-def delete_file_api():
-    session_id = session.get('session_id', 'default')
-    path = request.json.get('path')
+@app.post("/api/delete_file")
+async def delete_file_api(request: Request):
+    session_id = request.cookies.get("session_id")
+    if not session_id or session_id not in web_sessions:
+        return JSONResponse(content={'success': False, 'error': 'Session not found'})
     
-    if session_id not in user_sessions or not user_sessions[session_id].get('sftp'):
-        return jsonify({'success': False, 'error': 'Not connected'})
+    data = await request.json()
+    path = data.get('path')
+    
+    if not web_sessions[session_id].get('sftp'):
+        return JSONResponse(content={'success': False, 'error': 'Not connected'})
     
     try:
-        sftp = user_sessions[session_id]['sftp']
+        sftp = web_sessions[session_id]['sftp']
         
         # Проверяем, это папка или файл
-        file_attr = sftp.stat(path)
-        if paramiko.sftp_client.SFTPAttributes._from_dict({'st_mode': file_attr.st_mode}).__str__().startswith('d'):
-            sftp.rmdir(path)
-        else:
+        try:
+            sftp.stat(path)
+            # Это файл
             sftp.remove(path)
+        except:
+            # Это папка
+            sftp.rmdir(path)
         
-        return jsonify({'success': True})
+        return JSONResponse(content={'success': True})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
+        return JSONResponse(content={'success': False, 'error': str(e)})
 
-@app.route('/api/create_folder', methods=['POST'])
-def create_folder_api():
-    session_id = session.get('session_id', 'default')
-    path = request.json.get('path')
-    
-    if session_id not in user_sessions or not user_sessions[session_id].get('sftp'):
-        return jsonify({'success': False, 'error': 'Not connected'})
-    
-    try:
-        sftp = user_sessions[session_id]['sftp']
-        sftp.mkdir(path)
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/upload_files', methods=['POST'])
-def upload_files_api():
-    session_id = session.get('session_id', 'default')
-    
-    if session_id not in user_sessions or not user_sessions[session_id].get('sftp'):
-        return jsonify({'success': False, 'error': 'Not connected'})
-    
-    try:
-        path = request.form.get('path', '/')
-        files = request.files.getlist('files')
-        sftp = user_sessions[session_id]['sftp']
-        
-        uploaded = 0
-        for file in files:
-            if file.filename:
-                file_path = path.rstrip('/') + '/' + file.filename
-                with sftp.open(file_path, 'wb') as f:
-                    f.write(file.read())
-                uploaded += 1
-        
-        return jsonify({'success': True, 'uploaded': uploaded})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.before_request
-def before_request():
-    if 'session_id' not in session:
-        session['session_id'] = secrets.token_hex(16)
-
-# ============ TELEGRAM BOT (упрощенная версия) ============
+# ============ TELEGRAM BOT ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("➕ Добавить сервер", callback_data='add_server')],
-        [InlineKeyboardButton("📋 Список серверов", callback_data='list_servers')],
-        [InlineKeyboardButton("🌐 Открыть Web версию", url="https://sshagen.bothost.ru")]
+        [InlineKeyboardButton("🌐 Web версия", url="https://sshagen.bothost.ru")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
         "🚀 *SSH Agent Pro*\n\n"
-        "Расширенное управление серверами через SSH!\n\n"
-        "Функции:\n"
-        "✓ Терминал\n"
-        "✓ Файловый менеджер\n"
-        "✓ Мониторинг\n"
-        "✓ Управление процессами\n\n"
-        "Выберите действие:",
+        "Управляйте серверами через SSH!\n\n"
+        "Используйте /add для добавления сервера\n"
+        "Или откройте веб-версию для полного функционала.",
         parse_mode='Markdown',
         reply_markup=reply_markup
     )
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = str(query.from_user.id)
-    
-    if query.data == 'add_server':
-        await query.message.reply_text(
-            "Отправьте данные сервера в формате:\n\n"
-            "`название|хост|порт|пользователь|пароль`\n\n"
-            "Пример:\n"
-            "`Мой сервер|192.168.1.100|22|root|password123`",
-            parse_mode='Markdown'
-        )
-        context.user_data['awaiting'] = 'server_data'
-    
-    elif query.data == 'list_servers':
-        if user_id not in user_sessions or not user_sessions[user_id].get('servers'):
-            await query.message.reply_text("📋 У вас пока нет серверов")
-            return
-        
-        servers = user_sessions[user_id]['servers']
-        text = "*Ваши серверы:*\n\n"
-        for i, srv in enumerate(servers):
-            status = "🟢" if user_sessions[user_id].get('current_server') == i else "⚪"
-            text += f"{status} *{srv['name']}*\n"
-            text += f"  `{srv['user']}@{srv['host']}:{srv['port']}`\n\n"
-        
-        await query.message.reply_text(text, parse_mode='Markdown')
+async def add_server_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Отправьте данные сервера в формате:\n\n"
+        "`название|хост|порт|пользователь|пароль`\n\n"
+        "Пример:\n"
+        "`Мой сервер|192.168.1.100|22|root|password123`",
+        parse_mode='Markdown'
+    )
+    context.user_data['awaiting'] = 'server_data'
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
@@ -2138,81 +1640,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             parts = text.split('|')
             if len(parts) != 5:
-                await update.message.reply_text("❌ Неверный формат. Попробуйте снова.")
+                await update.message.reply_text("❌ Неверный формат. Используйте: название|хост|порт|пользователь|пароль")
                 return
             
             server = {
                 'name': parts[0].strip(),
                 'host': parts[1].strip(),
-                'port': parts[2].strip(),
+                'port': int(parts[2].strip()),
                 'user': parts[3].strip(),
                 'password': parts[4].strip()
             }
             
             if user_id not in user_sessions:
                 user_sessions[user_id] = {'servers': []}
-            user_sessions[user_id]['servers'].append(server)
             
+            user_sessions[user_id]['servers'].append(server)
             await update.message.reply_text(f"✅ Сервер *{server['name']}* добавлен!", parse_mode='Markdown')
             context.user_data['awaiting'] = None
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
-    
-    elif user_id in user_sessions and user_sessions[user_id].get('current_connection'):
-        try:
-            ssh = user_sessions[user_id]['current_connection']
-            stdin, stdout, stderr = ssh.exec_command(text)
-            output = stdout.read().decode() + stderr.read().decode()
             
-            if len(output) > 3000:
-                output = output[:3000] + "\n... (вывод обрезан)"
-            
-            if output:
-                await update.message.reply_text(f"```\n{output}\n```", parse_mode='Markdown')
-            else:
-                await update.message.reply_text("✅ Команда выполнена")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
     else:
         await update.message.reply_text("Используйте /start для начала работы")
 
-# ============ ЗАПУСК ТЕЛЕГРАМ БОТА ============
+# ============ ЗАПУСК ПРИЛОЖЕНИЯ ============
 telegram_app = None
 
 async def start_telegram_bot():
     global telegram_app
     try:
-        logger.info("Запуск Telegram бота...")
         telegram_app = Application.builder().token(BOT_TOKEN).build()
         
         telegram_app.add_handler(CommandHandler("start", start))
-        telegram_app.add_handler(CallbackQueryHandler(button_callback))
+        telegram_app.add_handler(CommandHandler("add", add_server_cmd))
         telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
         await telegram_app.initialize()
         await telegram_app.start()
-        await telegram_app.updater.start_polling(drop_pending_updates=True)
+        await telegram_app.updater.start_polling()
         
-        logger.info("Telegram бот запущен")
+        logger.info("Telegram бот запущен в режиме polling")
         
+        # Бесконечный цикл
         while True:
             await asyncio.sleep(3600)
+            
     except Exception as e:
-        logger.error(f"Ошибка запуска бота: {e}")
+        logger.error(f"Ошибка запуска Telegram бота: {e}")
 
-def run_telegram_bot_thread():
+def run_telegram_bot():
     asyncio.run(start_telegram_bot())
 
-# ============ ОСНОВНОЙ ЗАПУСК ============
-def main():
-    logger.info("=== SSH Agent Pro запущен ===")
-    
-    # Запускаем Telegram бот в отдельном потоке
-    bot_thread = threading.Thread(target=run_telegram_bot_thread, daemon=True)
-    bot_thread.start()
-    
-    logger.info(f"Flask приложение готово на порту {PORT}")
+# Запуск при старте
+import threading
+bot_thread = threading.Thread(target=run_telegram_bot, daemon=True)
+bot_thread.start()
 
-if __name__ == '__main__':
-    main()
-    # Flask запускается через gunicorn
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
