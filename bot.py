@@ -3,27 +3,39 @@ import json
 import secrets
 import asyncio
 import threading
+import logging
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify, session
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 import paramiko
 
+# ============ НАСТРОЙКА ЛОГГИНГА ============
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 # ============ КОНФИГУРАЦИЯ ============
 BOT_TOKEN = "8360387336:AAGKU0Jv3CeJ-WubZH6VCPsL4-NDlrcbxp4"
 SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
 # Bothost автоматически устанавливает PORT
-PORT = int(os.environ.get("PORT", 5000))
+PORT = int(os.environ.get("PORT", 3000))
 
-# Определяем домен
-HOSTNAME = os.environ.get("HOSTNAME", "sshagen.bothost.ru")
+# Определяем домен - используем internal domain от Bothost
+HOSTNAME = os.environ.get("HOSTNAME", os.environ.get("INTERNAL_DOMAIN", "f94c91e2287e"))
 WEBHOOK_URL = f"https://{HOSTNAME}"
 
-print(f"=== SSH Agent Bot ===")
-print(f"Hostname: {HOSTNAME}")
-print(f"Webhook URL: {WEBHOOK_URL}")
-print(f"Port: {PORT}")
+# Используем polling на Bothost
+USE_WEBHOOK = False
+
+logger.info(f"=== SSH Agent Bot ===")
+logger.info(f"Hostname: {HOSTNAME}")
+logger.info(f"Webhook URL: {WEBHOOK_URL}")
+logger.info(f"Port: {PORT}")
+logger.info(f"Use Webhook: {USE_WEBHOOK}")
 
 # ============ ХРАНИЛИЩЕ ДАННЫХ ============
 user_sessions = {}  # {user_id: {'servers': [], 'current_connection': None}}
@@ -611,7 +623,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("➕ Добавить сервер", callback_data='add_server')],
         [InlineKeyboardButton("📋 Список серверов", callback_data='list_servers')],
-        [InlineKeyboardButton("🌐 Открыть Web версию", url=WEBHOOK_URL)]
+        [InlineKeyboardButton("🌐 Открыть Web версию", url="https://sshagen.bothost.ru")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -744,15 +756,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Используйте /start для начала работы")
 
-# ============ НАСТРОЙКА TELEGRAM БОТА ============
+# ============ ЗАПУСК ТЕЛЕГРАМ БОТА ============
 telegram_app = None
 
-def setup_telegram_bot():
-    """Настройка Telegram бота"""
+async def start_telegram_bot():
+    """Запуск Telegram бота в режиме polling"""
     global telegram_app
     
     try:
-        print("Настройка Telegram бота...")
+        logger.info("Настройка Telegram бота...")
         telegram_app = Application.builder().token(BOT_TOKEN).build()
         
         # Добавляем обработчики
@@ -760,41 +772,38 @@ def setup_telegram_bot():
         telegram_app.add_handler(CallbackQueryHandler(button_callback))
         telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
         
-        print("Telegram бот настроен успешно")
-        return telegram_app
+        logger.info("Telegram бот настроен, запускаем polling...")
+        
+        # На Bothost используем polling
+        await telegram_app.initialize()
+        await telegram_app.start()
+        
+        # На Bothost polling работает лучше
+        await telegram_app.updater.start_polling(
+            poll_interval=1.0,
+            timeout=10,
+            drop_pending_updates=True
+        )
+        
+        logger.info("Telegram бот запущен в режиме polling")
+        
+        # Бесконечный цикл
+        while True:
+            await asyncio.sleep(3600)
+            
     except Exception as e:
-        print(f"Ошибка настройки бота: {e}")
-        return None
+        logger.error(f"Ошибка запуска бота: {e}")
+        import traceback
+        traceback.print_exc()
 
-async def start_telegram_bot():
-    """Запуск Telegram бота"""
-    global telegram_app
-    
-    if telegram_app is None:
-        telegram_app = setup_telegram_bot()
-    
-    if telegram_app:
-        try:
-            # На Bothost используем polling, а не webhook
-            print("Запуск Telegram бота в режиме polling...")
-            await telegram_app.initialize()
-            await telegram_app.start()
-            await telegram_app.updater.start_polling()
-            
-            print("Telegram бот запущен в режиме polling")
-            
-            # Ждём остановки
-            await telegram_app.updater.idle()
-            
-        except Exception as e:
-            print(f"Ошибка запуска бота: {e}")
-            import traceback
-            traceback.print_exc()
+def run_telegram_bot_thread():
+    """Запуск Telegram бота в отдельном потоке"""
+    asyncio.run(start_telegram_bot())
 
-# ============ WEBHOOK ENDPOINT ДЛЯ TELEGRAM ============
+# ============ WEBHOOK ENDPOINT ============
 @app.route(f'/{BOT_TOKEN}', methods=['POST'])
 async def telegram_webhook():
-    """Обработка webhook от Telegram (если потребуется)"""
+    """Обработка webhook от Telegram"""
     if telegram_app:
         json_data = await request.get_json()
         update = Update.de_json(json_data, telegram_app.bot)
@@ -803,45 +812,46 @@ async def telegram_webhook():
 
 @app.route('/set_webhook', methods=['GET'])
 def set_webhook():
-    """Установка webhook для Telegram"""
+    """Установка webhook для Telegram (опционально)"""
     try:
         import requests
-        response = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={WEBHOOK_URL}/{BOT_TOKEN}")
+        webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+        response = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}")
+        logger.info(f"Webhook установлен: {webhook_url}")
         return jsonify({'success': True, 'response': response.json()})
     except Exception as e:
+        logger.error(f"Ошибка установки webhook: {e}")
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/health')
 def health_check():
     """Проверка здоровья приложения"""
-    return jsonify({'status': 'ok', 'bot': telegram_app is not None})
+    return jsonify({
+        'status': 'ok', 
+        'bot': telegram_app is not None,
+        'web_url': WEBHOOK_URL,
+        'domain': HOSTNAME
+    })
 
-# ============ ЗАПУСК ПРИЛОЖЕНИЯ ============
-def run_flask():
-    """Запуск Flask приложения"""
-    print(f"Запуск Flask на порту {PORT}")
-    app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
-
-def start_both():
-    """Запуск Flask и Telegram бота в разных потоках"""
-    print("=== Запуск SSH Agent ===")
-    print(f"Web версия: {WEBHOOK_URL}")
+# ============ ОСНОВНОЙ ЗАПУСК ============
+def main():
+    """Основная функция запуска"""
+    logger.info("=== Запуск SSH Agent ===")
+    logger.info(f"Web версия будет доступна")
+    logger.info(f"Telegram бот запускается в режиме polling")
     
-    # Запускаем Flask в отдельном потоке
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    # Запускаем Telegram бота в основном потоке
-    asyncio.run(start_telegram_bot())
-
-if __name__ == '__main__':
-    # На Bothost нужно запускать через gunicorn, поэтому
-    # просто экспортируем app для gunicorn
-    # Бот запустится автоматически при импорте
-    print("SSH Agent Bot инициализирован")
-    print(f"Домен: {HOSTNAME}")
-    
-    # Запускаем бота в фоновом режиме
-    import threading
-    bot_thread = threading.Thread(target=lambda: asyncio.run(start_telegram_bot()), daemon=True)
+    # Запускаем Telegram бот в отдельном потоке
+    bot_thread = threading.Thread(target=run_telegram_bot_thread, daemon=True)
     bot_thread.start()
+    
+    # Flask запустится автоматически через gunicorn (Procfile)
+    logger.info(f"Flask приложение готово к работе на порту {PORT}")
+
+# Запускаем при старте
+if __name__ == '__main__':
+    # На Bothost приложение запускается через gunicorn
+    # Эта часть нужна только для локального тестирования
+    main()
+    
+    # Для локального тестирования можно запустить Flask
+    app.run(host='0.0.0.0', port=PORT, debug=False)
